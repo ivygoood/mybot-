@@ -1,5 +1,5 @@
 """
-Работа с SQLite: пользователи + задачи-напоминания.
+Работа с SQLite: пользователи + задачи + статистика.
 """
 import sqlite3
 from datetime import datetime
@@ -68,7 +68,6 @@ def add_task(user_id: int, text: str, remind_at: datetime) -> int:
 
 
 def get_pending_tasks(user_id: Optional[int] = None) -> list[dict]:
-    """Все невыполненные задачи. Если указан user_id — только его."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     if user_id is None:
@@ -126,7 +125,6 @@ def mark_task_status(task_id: int, status: str) -> None:
 
 
 def cancel_all_user_tasks(user_id: int) -> int:
-    """Отменяет ВСЕ активные задачи пользователя. Возвращает количество."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -137,3 +135,40 @@ def cancel_all_user_tasks(user_id: int) -> int:
     conn.commit()
     conn.close()
     return count
+
+
+# ---------- Статистика ----------
+
+def get_user_stats(user_id: int) -> dict:
+    """Возвращает {'done': N, 'failed': N, 'cancelled': N, 'pending': N}."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT status, COUNT(*) FROM tasks WHERE user_id = ? GROUP BY status
+    """, (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    stats = {"done": 0, "failed": 0, "cancelled": 0, "pending": 0}
+    for status, count in rows:
+        if status in stats:
+            stats[status] = count
+    return stats
+
+
+def get_user_stats_by_period(user_id: int, days: int = 7) -> dict:
+    """Статистика за последние N дней."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    threshold = (datetime.now() - __import__("datetime").timedelta(days=days)).isoformat()
+    cur.execute("""
+        SELECT status, COUNT(*) FROM tasks
+        WHERE user_id = ? AND remind_at >= ?
+        GROUP BY status
+    """, (user_id, threshold))
+    rows = cur.fetchall()
+    conn.close()
+    stats = {"done": 0, "failed": 0, "cancelled": 0, "pending": 0}
+    for status, count in rows:
+        if status in stats:
+            stats[status] = count
+    return stats
