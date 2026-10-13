@@ -1,5 +1,5 @@
 """
-Бот-напоминалка с характером. Версия 8 — актуальная модель Groq.
+Бот-напоминалка с характером. Версия 9 — с /help и /settings.
 """
 import os
 import re
@@ -136,7 +136,8 @@ def ask_groq(user_id: int, user_message: str, mode: str) -> str:
         )
         answer = response.choices[0].message.content.strip()
     except Exception as e:
-        # Показываем ТОЧНУЮ ошибку, чтобы понять, что чинить
+        # Показываем ТОЧНУЮ ошибку, чтобы понять, что чинить.
+        # Потом заменим на вежливую заглушку.
         logging.error("Ошибка Groq: %s", e)
         answer = f"❌ Ошибка Groq: {type(e).__name__}: {e}"
 
@@ -182,12 +183,45 @@ def parse_time(amount: int, unit: str) -> tuple[timedelta, str]:
 async def cmd_start(message: Message):
     current = get_user_mode(message.from_user.id)
     await message.answer(
-        f"Здорово, бро! Я твой кореш.\n"
-        f"Текущий режим: *{current}*.\n\n"
-        f"Можешь просто болтать со мной, а можешь попросить напомнить:\n"
-        f"«напомни через 5 минут сделать пиццу»\n\n"
-        f"Стиль общения меняется кнопками снизу.",
+        "👋 *Здорово, бро! Я твой кореш.*\n\n"
+        "Что я умею:\n"
+        "• ⏰ *Напоминать* — «напомни через 30 минут позвонить маме»\n"
+        "• 💬 *Болтать* — просто напиши мне что угодно, я отвечу\n"
+        "• 🎭 *Менять характер* — у меня три режима настроения\n\n"
+        f"Сейчас у тебя включён режим: *{current}*\n\n"
+        "Выбирай стиль кнопками снизу или жми /help, чтобы узнать больше.",
         reply_markup=mode_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "🤝 *Что я умею:*\n\n"
+        "⏰ *Напоминания*\n"
+        "Напиши «напомни через 5 минут сделать пиццу» — я напомню.\n\n"
+        "💬 *Живое общение*\n"
+        "Просто пиши мне как другу. Я помню контекст диалога, "
+        "так что можем болтать о чём угодно.\n\n"
+        "🎭 *Три режима настроения*\n"
+        "😈 *Токсичный* — дерзкий и подкалываю\n"
+        "🤪 *Угарный* — весёлый и тёплый\n"
+        "🧐 *Серьёзный* — спокойный и по делу\n\n"
+        "Меняй режим кнопками снизу.",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
+    current = get_user_mode(message.from_user.id)
+    await message.answer(
+        f"⚙️ *Настройки*\n\n"
+        f"🎭 Текущий режим: *{current}*\n\n"
+        f"Меняй режим кнопками снизу.\n\n"
+        f"💎 Подписка и дополнительные фишки — скоро.",
+        parse_mode="Markdown",
     )
 
 
