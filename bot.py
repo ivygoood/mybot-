@@ -1,9 +1,9 @@
 """
-Бот-напоминалка с характером. Версия 13:
-- запрет на "спортсмен"/"чемпион"/"герой"
-- разные обращения в сообщениях
+Бот-напоминалка с характером. Версия 14:
+- watchdog для polling (не даёт зависнуть)
+- запрет "спортсмен"/"чемпион"/"герой"
 - отмена напоминаний
-- "напомни мне через минуту" тоже работает
+- "напомни мне через минуту" работает
 """
 import os
 import re
@@ -572,14 +572,33 @@ async def restore_pending_tasks():
         logging.info("Восстановлена задача #%s на %s", task["id"], remind_at)
 
 
-# ---------- Запуск ----------
+# ---------- Запуск с watchdog ----------
 async def main():
     init_db()
     scheduler.start()
     threading.Thread(target=run_health_server, daemon=True).start()
     await restore_pending_tasks()
     logging.info("Бот запускается...")
-    await dp.start_polling(bot)
+
+    # Watchdog: каждые 3 минуты принудительно перезапускаем polling,
+    # чтобы он не мог зависнуть молча.
+    # Простой между циклами — 2-3 секунды, пользователь не заметит.
+    while True:
+        try:
+            await asyncio.wait_for(dp.start_polling(bot), timeout=180)
+            logging.warning("Polling завершился сам. Перезапускаю через 3 сек...")
+        except asyncio.TimeoutError:
+            logging.warning("⏰ Watchdog: плановый перезапуск polling")
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+        except Exception as e:
+            logging.error("Polling упал: %s. Перезапускаю через 5 сек...", e)
+            await asyncio.sleep(5)
+            continue
+
+        await asyncio.sleep(3)
 
 
 if __name__ == "__main__":
