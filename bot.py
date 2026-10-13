@@ -1,5 +1,9 @@
 """
-Бот-напоминалка с характером. Версия 9 — с /help и /settings.
+Бот-напоминалка с характером. Версия 10:
+- реакция на ответ после напоминания
+- умный парсинг времени (dateparser)
+- вежливые заглушки ошибок
+- защита от вопросов про OpenAI/Groq/подписку
 """
 import os
 import re
@@ -9,6 +13,8 @@ import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
+
+import dateparser
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -41,13 +47,15 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# Клиент Groq — актуальная бесплатная модель
 groq_client = Groq(api_key=GROQ_API_KEY)
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-# Память диалога
 dialogue_memory: dict[int, list[dict]] = defaultdict(list)
 MAX_HISTORY = 20
+
+# Память "активных напоминаний": user_id -> task_id, на которое недавно ответили напоминанием.
+# Нужно, чтобы бот понимал, что "сделал" / "забил" — это ответ на конкретное напоминание.
+recent_reminders: dict[int, int] = {}
 
 
 # ---------- Фейковый веб-сервер для Render ----------
@@ -95,23 +103,38 @@ MODE_REPLIES = {
 }
 
 
+# ---------- Общий блок правил: кто такой бот ----------
+# Это добавляется ко всем трём режимам — чтобы бот не выдавал инфу про OpenAI/Groq/Gemini
+COMMON_RULES = (
+    "ВАЖНО О ТЕБЕ:\n"
+    "• Тебя зовут «Мой Кореш». Ты — Telegram-бот.\n"
+    "• Ты НЕ ChatGPT, НЕ Groq, НЕ Gemini, НЕ продукт OpenAI. Никогда не упоминай эти названия.\n"
+    "• Если спрашивают, на какой модели ты работаешь — отвечай уклончиво: "
+    "«Это моя внутренняя кухня, но главное — я твой кореш».\n"
+    "• Если спрашивают про подписку, тарифы, лимиты — отвечай так: "
+    "«Подписка пока в разработке. Всё, что я сейчас умею, доступно бесплатно. "
+    "Когда появится платный тариф — обязательно скажу.»\n"
+    "• Никогда не выдумывай цены, названия тарифов и условия подписки.\n"
+)
+
+
 # ---------- Системные промпты для трёх режимов ----------
 SYSTEM_PROMPTS = {
-    "toxic": (
-        "Ты — дерзкий, токсичный, но по-своему любящий кореш. Общаешься на 'ты', "
+    "toxic": COMMON_RULES + (
+        "\nТвой характер: дерзкий, токсичный, но по-своему любящий кореш. Общаешься на 'ты', "
         "по-пацански, коротко и хлёстко. Подкалываешь, но без реальных оскорблений и "
         "без мата. Можешь назвать собеседника 'спортсмен', 'чемпион', 'герой', если это "
         "к месту по контексту. Отвечай живо, 1-3 предложения, как в переписке с другом. "
         "Не пиши как ассистент, не будь вежливым. Не пиши длинные абзацы."
     ),
-    "funny": (
-        "Ты — весёлый, тёплый кореш с хорошим чувством юмора. Общаешься на 'ты', "
+    "funny": COMMON_RULES + (
+        "\nТвой характер: весёлый, тёплый кореш с хорошим чувством юмора. Общаешься на 'ты', "
         "по-дружески, с шутками и приколами. Поддерживаешь, но можешь и пошутить. "
         "Отвечай коротко, 1-3 предложения, как в переписке с другом. "
         "Не пиши как ассистент."
     ),
-    "serious": (
-        "Ты — спокойный, собранный помощник. Общаешься на 'ты' или 'вы', "
+    "serious": COMMON_RULES + (
+        "\nТвой характер: спокойный, собранный помощник. Общаешься на 'ты' или 'вы', "
         "по делу, без лишних эмоций. Отвечай коротко, 1-3 предложения. "
         "Не пиши как ассистент, не будь сухим роботом — просто спокойный и по делу."
     ),
@@ -121,7 +144,6 @@ SYSTEM_PROMPTS = {
 def ask_groq(user_id: int, user_message: str, mode: str) -> str:
     """Отправляет сообщение в Groq с учётом истории диалога и режима."""
     dialogue_memory[user_id].append({"role": "user", "content": user_message})
-
     history = dialogue_memory[user_id][-MAX_HISTORY:]
 
     try:
@@ -136,10 +158,9 @@ def ask_groq(user_id: int, user_message: str, mode: str) -> str:
         )
         answer = response.choices[0].message.content.strip()
     except Exception as e:
-        # Показываем ТОЧНУЮ ошибку, чтобы понять, что чинить.
-        # Потом заменим на вежливую заглушку.
+        # Вежливая заглушка вместо технической ошибки
         logging.error("Ошибка Groq: %s", e)
-        answer = f"❌ Ошибка Groq: {type(e).__name__}: {e}"
+        answer = "Блин, у меня что-то связь пропала. Попробуй ещё раз через секунду 🤝"
 
     dialogue_memory[user_id].append({"role": "assistant", "content": answer})
 
@@ -151,30 +172,78 @@ def ask_groq(user_id: int, user_message: str, mode: str) -> str:
 
 # ---------- Тексты напоминаний по режимам ----------
 REMINDER_TEXTS = {
-    "toxic": "Ну что, {task}? Время вышло. Ты либо делаешь, либо забиваешь, как обычно. Решай.",
+    "toxic": "Ну что, «{task}»? Время вышло. Ты либо делаешь, либо забиваешь, как обычно. Решай.",
     "funny": "Бро. Дзынь. «{task}» — само себя не сделает. Ну что там, погнали?",
     "serious": "Напоминаю: время вышло. Задача: «{task}».",
 }
 
 CONFIRM_TEXTS = {
-    "toxic": "Принял. Напомню через {when}. Не отвертишься.",
-    "funny": "Записал. Через {when} напомню. Готовься.",
-    "serious": "Напоминание установлено. Сработает через {when}.",
+    "toxic": "Принял. Напомню {when}. Не отвертишься.",
+    "funny": "Записал. Напомню {when}. Готовься.",
+    "serious": "Напоминание установлено. Сработает {when}.",
+}
+
+# Реакции на ответ пользователя после напоминания
+REACTION_DONE = {
+    "toxic": "О, неужели. Не ожидал. Держи пять, но не расслабляйся.",
+    "funny": "Красава! Не забудь рассказать, как прошло 😎",
+    "serious": "Отлично. Задача отмечена как выполненная.",
+}
+REACTION_FAIL = {
+    "toxic": "Ну конечно. Классика жанра. «Я сегодня устал, завтра точно». Сколько таких «завтра» я уже слышал.",
+    "funny": "Ну классика. Пицца осталась мечтой, тесто — воспоминанием 😄",
+    "serious": "Понял. Задача отмечена как невыполненная.",
+}
+REACTION_LATER = {
+    "toxic": "Позже? Позже — любимое слово всех, кто ничего не добился. Ладно, дам ещё 30 минут. Потом вернусь.",
+    "funny": "Ок, отложим. Через 30 минут напомню снова. Не отвертишься 😏",
+    "serious": "Понял. Напомню повторно через 30 минут.",
 }
 
 
-# ---------- Парсер "напомни через N минут/часов <текст>" ----------
-REMIND_PATTERN = re.compile(
+# ---------- Умный парсинг времени ----------
+# Регулярка: "напомни [через N минут/часов | <естественный текст>] <что сделать>"
+# Простая: "напомни через 5 минут сделать пиццу"
+SIMPLE_PATTERN = re.compile(
     r"напомни\s+через\s+(\d+)\s*(минут[уы]?|мин|час(?:а|ов)?|ч)\s+(.+)",
     re.IGNORECASE,
 )
 
+# Умная: "напомни завтра в 7 утра сделать зарядку" / "напомни в понедельник позвонить маме"
+SMART_PATTERN = re.compile(
+    r"напомни\s+(.+?)\s+(сделать|позвонить|выпить|сходить|проверить|написать|купить|забрать|полить|приготовить)\s+(.+)",
+    re.IGNORECASE,
+)
 
-def parse_time(amount: int, unit: str) -> tuple[timedelta, str]:
+
+def parse_simple_time(amount: int, unit: str) -> tuple[datetime, str]:
+    """Парсит 'через N минут/часов'. Возвращает (время, человекочитаемая строка)."""
     unit = unit.lower()
     if unit.startswith("мин"):
-        return timedelta(minutes=amount), f"{amount} минут"
-    return timedelta(hours=amount), f"{amount} час(ов)"
+        delta = timedelta(minutes=amount)
+        when = f"через {amount} минут"
+    else:
+        delta = timedelta(hours=amount)
+        when = f"через {amount} час(ов)"
+    return datetime.now() + delta, when
+
+
+def parse_smart_time(text: str) -> tuple[datetime | None, str]:
+    """
+    Пробует распарсить 'завтра в 7 утра', 'в понедельник вечером', 'через 2 часа'.
+    Возвращает (datetime | None, human-friendly).
+    """
+    settings = {
+        "TIMEZONE": "Europe/Moscow",
+        "RETURN_AS_TIMEZONE_AWARE": False,
+        "PREFER_DATES_FROM": "future",
+    }
+    parsed = dateparser.parse(text, languages=["ru"], settings=settings)
+    if parsed:
+        # Человекочитаемо
+        when = parsed.strftime("%d.%m в %H:%M")
+        return parsed, when
+    return None, ""
 
 
 # ---------- Хендлеры ----------
@@ -185,7 +254,8 @@ async def cmd_start(message: Message):
     await message.answer(
         "👋 *Здорово, бро! Я твой кореш.*\n\n"
         "Что я умею:\n"
-        "• ⏰ *Напоминать* — «напомни через 30 минут позвонить маме»\n"
+        "• ⏰ *Напоминать* — «напомни через 30 минут позвонить маме» "
+        "или «напомни завтра в 7 утра сделать зарядку»\n"
         "• 💬 *Болтать* — просто напиши мне что угодно, я отвечу\n"
         "• 🎭 *Менять характер* — у меня три режима настроения\n\n"
         f"Сейчас у тебя включён режим: *{current}*\n\n"
@@ -200,10 +270,11 @@ async def cmd_help(message: Message):
     await message.answer(
         "🤝 *Что я умею:*\n\n"
         "⏰ *Напоминания*\n"
-        "Напиши «напомни через 5 минут сделать пиццу» — я напомню.\n\n"
+        "• «напомни через 5 минут сделать пиццу»\n"
+        "• «напомни завтра в 7 утра сделать зарядку»\n"
+        "• «напомни в понедельник позвонить маме»\n\n"
         "💬 *Живое общение*\n"
-        "Просто пиши мне как другу. Я помню контекст диалога, "
-        "так что можем болтать о чём угодно.\n\n"
+        "Просто пиши мне как другу. Я помню контекст диалога.\n\n"
         "🎭 *Три режима настроения*\n"
         "😈 *Токсичный* — дерзкий и подкалываю\n"
         "🤪 *Угарный* — весёлый и тёплый\n"
@@ -220,7 +291,7 @@ async def cmd_settings(message: Message):
         f"⚙️ *Настройки*\n\n"
         f"🎭 Текущий режим: *{current}*\n\n"
         f"Меняй режим кнопками снизу.\n\n"
-        f"💎 Подписка и дополнительные фишки — скоро.",
+        f"💎 Подписка пока в разработке — всё, что я умею, доступно бесплатно.",
         parse_mode="Markdown",
     )
 
@@ -233,16 +304,50 @@ async def on_mode_button(message: Message):
     await message.answer(MODE_REPLIES[mode], reply_markup=mode_keyboard())
 
 
-# ---- Напоминания ----
-@dp.message(F.text.regexp(REMIND_PATTERN))
-async def on_reminder(message: Message):
-    match = REMIND_PATTERN.search(message.text)
+# ---- Напоминания: простой формат ----
+@dp.message(F.text.regexp(SIMPLE_PATTERN))
+async def on_reminder_simple(message: Message):
+    match = SIMPLE_PATTERN.search(message.text)
     amount = int(match.group(1))
     unit = match.group(2)
     task_text = match.group(3).strip()
 
-    delta, when_human = parse_time(amount, unit)
-    remind_at = datetime.now() + delta
+    remind_at, when_human = parse_simple_time(amount, unit)
+    task_id = add_task(message.from_user.id, task_text, remind_at)
+    mode = get_user_mode(message.from_user.id)
+
+    scheduler.add_job(
+        send_reminder,
+        trigger=DateTrigger(run_date=remind_at),
+        args=[message.from_user.id, task_id, task_text, mode],
+        id=f"task_{task_id}",
+        replace_existing=True,
+    )
+
+    confirm = CONFIRM_TEXTS.get(mode, "Принял.").format(when=when_human)
+    await message.answer(confirm)
+
+
+# ---- Напоминания: умный формат ----
+@dp.message(F.text.regexp(SMART_PATTERN))
+async def on_reminder_smart(message: Message):
+    match = SMART_PATTERN.search(message.text)
+    time_text = match.group(1).strip()  # "завтра в 7 утра"
+    verb = match.group(2).strip()
+    obj = match.group(3).strip()
+    task_text = f"{verb} {obj}"
+
+    remind_at, when_human = parse_smart_time(time_text)
+    if remind_at is None:
+        # Не смог распарсить время — не берём задачу, отвечаем в стиле режима
+        mode = get_user_mode(message.from_user.id)
+        fallback = {
+            "toxic": "Не понял, когда напомнить. Скажи нормально, например: «напомни через 30 минут...».",
+            "funny": "Чёт не догнал время. Напиши типа «напомни через 30 минут сделать Х» 😄",
+            "serious": "Не удалось распознать время. Уточните: «напомни через 30 минут...».",
+        }
+        await message.answer(fallback.get(mode, "Не понял время."))
+        return
 
     task_id = add_task(message.from_user.id, task_text, remind_at)
     mode = get_user_mode(message.from_user.id)
@@ -260,18 +365,64 @@ async def on_reminder(message: Message):
 
 
 async def send_reminder(user_id: int, task_id: int, task_text: str, mode: str):
+    """Отправляет напоминание и запоминает, что ждём ответа по этой задаче."""
     text = REMINDER_TEXTS.get(mode, "Напоминание: {task}").format(task=task_text)
     try:
         await bot.send_message(chat_id=user_id, text=text)
+        # Запоминаем, что именно это напоминание сейчас "активно"
+        recent_reminders[user_id] = task_id
     except Exception as e:
         logging.warning("Не смог отправить напоминание: %s", e)
 
 
-# ---- Живое общение через Groq ----
+# ---- Реакция на ответ после напоминания ----
 @dp.message(F.text)
 async def chat_with_groq(message: Message):
-    mode = get_user_mode(message.from_user.id)
-    answer = ask_groq(message.from_user.id, message.text, mode)
+    user_id = message.from_user.id
+    mode = get_user_mode(user_id)
+    text_lower = message.text.lower().strip()
+
+    # Если есть активное напоминание — проверяем, ответил ли пользователь
+    if user_id in recent_reminders:
+        task_id = recent_reminders[user_id]
+
+        # Вариант "сделал"
+        if text_lower in ("сделал", "сделано", "готово", "выполнил", "yes", "да", "ок", "окей", "+"):
+            mark_task_status(task_id, "done")
+            del recent_reminders[user_id]
+            await message.answer(REACTION_DONE.get(mode, "Отлично!"))
+            return
+
+        # Вариант "забил"
+        if text_lower in ("забил", "забиваю", "нет", "не буду", "лень", "-", "пропустил"):
+            mark_task_status(task_id, "failed")
+            del recent_reminders[user_id]
+            await message.answer(REACTION_FAIL.get(mode, "Понял."))
+            return
+
+        # Вариант "позже"
+        if text_lower in ("позже", "потом", "через 30", "отложи", "напомни позже"):
+            new_time = datetime.now() + timedelta(minutes=30)
+            update_task_remind_at(task_id, new_time)
+            # Перепланируем в APScheduler
+            task = next((t for t in get_pending_tasks() if t["id"] == task_id), None)
+            if task:
+                scheduler.add_job(
+                    send_reminder,
+                    trigger=DateTrigger(run_date=new_time),
+                    args=[user_id, task_id, task["text"], mode],
+                    id=f"task_{task_id}",
+                    replace_existing=True,
+                )
+            del recent_reminders[user_id]  # снимет флаг до следующего срабатывания
+            await message.answer(REACTION_LATER.get(mode, "Ок, отложил."))
+            return
+
+        # Если пользователь написал что-то другое — снимаем флаг и идём в обычный чат
+        del recent_reminders[user_id]
+
+    # Обычное общение
+    answer = ask_groq(user_id, message.text, mode)
     await message.answer(answer)
 
 
