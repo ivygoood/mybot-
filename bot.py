@@ -1,5 +1,5 @@
 """
-Бот-напоминалка с характером. Версия 7 — с показом ошибок Groq.
+Бот-напоминалка с характером. Версия 8 — актуальная модель Groq.
 """
 import os
 import re
@@ -41,9 +41,9 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# Клиент Groq
+# Клиент Groq — актуальная бесплатная модель
 groq_client = Groq(api_key=GROQ_API_KEY)
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 # Память диалога
 dialogue_memory: dict[int, list[dict]] = defaultdict(list)
