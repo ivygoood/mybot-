@@ -1,6 +1,6 @@
 """
-Бот-напоминалка с характером. Версия 14:
-- watchdog для polling (не даёт зависнуть)
+Бот-напоминалка с характером. Версия 15:
+- Webhook вместо Polling
 - запрет "спортсмен"/"чемпион"/"герой"
 - отмена напоминаний
 - "напомни мне через минуту" работает
@@ -9,12 +9,12 @@ import os
 import re
 import asyncio
 import logging
-import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
 
 import dateparser
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -23,6 +23,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from groq import Groq
@@ -36,6 +37,11 @@ from database import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
+
+# Render даёт URL автоматически — это база для webhook
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://mybot-ba32.onrender.com")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "my-super-secret-2026")
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
@@ -54,14 +60,11 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 dialogue_memory: dict[int, list[dict]] = defaultdict(list)
 MAX_HISTORY = 20
 
-# user_id -> {"task_id", "task_text"} — активная задача после напоминания
 recent_reminders: dict[int, dict] = {}
-
-# user_id -> список ожидающих выбора задач (для отмены)
 pending_cancel: dict[int, list[dict]] = {}
 
 
-# ---------- Фейковый веб-сервер для Render ----------
+# ---------- Health-сервер для UptimeRobot ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -353,7 +356,6 @@ async def on_mode_button(message: Message):
     await message.answer(MODE_REPLIES[mode], reply_markup=mode_keyboard())
 
 
-# ---- Отмена напоминаний ----
 @dp.message(F.text.regexp(CANCEL_PATTERN))
 async def on_cancel_request(message: Message):
     user_id = message.from_user.id
@@ -396,7 +398,6 @@ async def on_cancel_request(message: Message):
     )
 
 
-# ---- Выбор номера для отмены ----
 @dp.message(F.text.regexp(r"^\d+$"))
 async def on_cancel_number(message: Message):
     user_id = message.from_user.id
@@ -425,7 +426,6 @@ async def on_cancel_number(message: Message):
     await message.answer(f"Ок, убрал напоминание про «{task['text']}».")
 
 
-# ---- Напоминания: словарный ----
 @dp.message(F.text.regexp(WORD_TIME_PATTERN))
 async def on_reminder_word(message: Message):
     match = WORD_TIME_PATTERN.search(message.text)
@@ -450,7 +450,6 @@ async def on_reminder_word(message: Message):
     await message.answer(confirm)
 
 
-# ---- Напоминания: числовой ----
 @dp.message(F.text.regexp(SIMPLE_PATTERN))
 async def on_reminder_simple(message: Message):
     match = SIMPLE_PATTERN.search(message.text)
@@ -474,7 +473,6 @@ async def on_reminder_simple(message: Message):
     await message.answer(confirm)
 
 
-# ---- Напоминания: умный ----
 @dp.message(F.text.regexp(SMART_PATTERN))
 async def on_reminder_smart(message: Message):
     match = SMART_PATTERN.search(message.text)
@@ -518,7 +516,6 @@ async def send_reminder(user_id: int, task_id: int, task_text: str, mode: str):
         logging.warning("Не смог отправить напоминание: %s", e)
 
 
-# ---- Основной чат ----
 @dp.message(F.text)
 async def handle_message(message: Message):
     user_id = message.from_user.id
@@ -572,33 +569,57 @@ async def restore_pending_tasks():
         logging.info("Восстановлена задача #%s на %s", task["id"], remind_at)
 
 
-# ---------- Запуск с watchdog ----------
+# ---------- Webhook-сервер ----------
+async def on_startup(bot: Bot) -> None:
+    """Регистрируем webhook в Telegram при старте."""
+    webhook_url = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+    await bot.set_webhook(
+        url=webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+    )
+    logging.info("Webhook установлен: %s", webhook_url)
+
+
+async def on_shutdown(bot: Bot) -> None:
+    await bot.delete_webhook()
+    logging.warning("Webhook удалён. Завершение работы...")
+
+
 async def main():
     init_db()
     scheduler.start()
-    threading.Thread(target=run_health_server, daemon=True).start()
     await restore_pending_tasks()
-    logging.info("Бот запускается...")
 
-    # Watchdog: каждые 3 минуты принудительно перезапускаем polling,
-    # чтобы он не мог зависнуть молча.
-    # Простой между циклами — 2-3 секунды, пользователь не заметит.
-    while True:
-        try:
-            await asyncio.wait_for(dp.start_polling(bot), timeout=180)
-            logging.warning("Polling завершился сам. Перезапускаю через 3 сек...")
-        except asyncio.TimeoutError:
-            logging.warning("⏰ Watchdog: плановый перезапуск polling")
-            try:
-                await bot.session.close()
-            except Exception:
-                pass
-        except Exception as e:
-            logging.error("Polling упал: %s. Перезапускаю через 5 сек...", e)
-            await asyncio.sleep(5)
-            continue
+    # Отдельный поток для health-сервера (UptimeRobot)
+    import threading
+    threading.Thread(target=run_health_server, daemon=True).start()
 
-        await asyncio.sleep(3)
+    # Регистрируем startup/shutdown
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    # aiohttp приложение для webhook
+    app = web.Application()
+
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    )
+    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+
+    # Запускаем на том же порту, что даёт Render
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info("Webhook-сервер слушает порт %s", PORT)
+
+    # Держим процесс живым
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
