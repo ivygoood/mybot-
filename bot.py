@@ -1,8 +1,10 @@
 """
-Бот-напоминалка с характером. Версия 15:
-- Webhook вместо Polling
-- запрет "спортсмен"/"чемпион"/"герой"
-- отмена напоминаний
+Бот-напоминалка с характером. Версия 16:
+- Webhook вместо Polling (без ошибок Conflict)
+- Один сервер: / для UptimeRobot + /webhook для Telegram
+- Счётчик "сливов": бот считает, сколько раз ты забил, и подкалывает
+- Запрет "спортсмен"/"чемпион"/"герой"
+- Отмена напоминаний
 - "напомни мне через минуту" работает
 """
 import os
@@ -10,7 +12,6 @@ import re
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
 
 import dateparser
@@ -32,13 +33,14 @@ from database import (
     init_db, get_user_mode, set_user_mode,
     add_task, get_pending_tasks, get_task_by_id,
     update_task_remind_at, mark_task_status, cancel_all_user_tasks,
+    get_user_stats, get_user_stats_by_period,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Render даёт URL автоматически — это база для webhook
+# Render даёт URL автоматически — база для webhook
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://mybot-ba32.onrender.com")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "my-super-secret-2026")
@@ -62,24 +64,6 @@ MAX_HISTORY = 20
 
 recent_reminders: dict[int, dict] = {}
 pending_cancel: dict[int, list[dict]] = {}
-
-
-# ---------- Health-сервер для UptimeRobot ----------
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive")
-
-    def log_message(self, *args):
-        pass
-
-
-def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logging.info("Health-сервер запущен на порту %s", PORT)
-    server.serve_forever()
 
 
 # ---------- Клавиатура ----------
@@ -198,17 +182,6 @@ CONFIRM_TEXTS = {
     "serious": "Напоминание установлено. Сработает {when}.",
 }
 
-REACTION_DONE = {
-    "toxic": "О, неужели. Не ожидал. Держи пять, но не расслабляйся.",
-    "funny": "Красава! Не забудь рассказать, как прошло 😎",
-    "serious": "Отлично. Задача отмечена как выполненная.",
-}
-REACTION_FAIL = {
-    "toxic": "Ну конечно. Классика жанра. «Я сегодня устал, завтра точно». Записал как забил.",
-    "funny": "Ну классика. Записал как забил, больше не дёргаю 😄",
-    "serious": "Понял. Задача отмечена как невыполненная.",
-}
-
 
 DONE_WORDS = {
     "сделал", "сделала", "сделано", "готово", "выполнил", "выполнено",
@@ -229,6 +202,74 @@ def normalize_answer(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^\w\s\-+]", "", text, flags=re.UNICODE)
     return text.strip()
+
+
+# ---------- Умные реакции на "сделал"/"забил" в зависимости от статистики ----------
+def reaction_done(user_id: int, mode: str) -> str:
+    """Возвращает фразу на 'сделал' с учётом статистики."""
+    stats = get_user_stats(user_id)
+    done = stats.get("done", 0)
+    failed = stats.get("failed", 0)
+    total = done + failed
+
+    # Если это первая-вторая задача — базовая похвала
+    if total <= 2:
+        base = {
+            "toxic": "О, неужели. Не ожидал. Держи пять, но не расслабляйся.",
+            "funny": "Красава! Не забудь рассказать, как прошло 😎",
+            "serious": "Отлично. Задача отмечена как выполненная.",
+        }
+        return base.get(mode, "Отлично!")
+
+    # Если выполнено много — хвалим сильнее
+    if done >= 5 and done > failed:
+        praise = {
+            "toxic": f"Опа, {done} задач закрыто. Я в шоке, если честно. Продолжай, и может из тебя выйдет толк.",
+            "funny": f"Слушай, {done} задач — это уже не случайность, это система! Горжусь тобой 😎",
+            "serious": f"Отличный результат. {done} выполненных задач. Так держать.",
+        }
+        return praise.get(mode, "Отлично!")
+
+    # Обычная похвала
+    base = {
+        "toxic": "Сделал. Ну наконец-то. Следующая задача сама себя не сделает.",
+        "funny": "Красава! Что там у нас дальше? 😎",
+        "serious": "Принято. Задача отмечена как выполненная.",
+    }
+    return base.get(mode, "Отлично!")
+
+
+def reaction_fail(user_id: int, mode: str) -> str:
+    """Возвращает фразу на 'забил' с учётом статистики."""
+    stats = get_user_stats(user_id)
+    failed = stats.get("failed", 0)
+    done = stats.get("done", 0)
+
+    # Если забил впервые — мягко
+    if failed == 1:
+        base = {
+            "toxic": "Ну конечно. Классика жанра. «Я сегодня устал, завтра точно». Записал как забил.",
+            "funny": "Ну классика. Записал как забил, больше не дёргаю 😄",
+            "serious": "Понял. Задача отмечена как невыполненная.",
+        }
+        return base.get(mode, "Понял.")
+
+    # Если забивает часто — усиливаем
+    if failed >= 5 and failed > done:
+        roast = {
+            "toxic": f"Уже {failed} задач забито. Ты вообще собирался что-то делать или так, для галочки мне написал?",
+            "funny": f"{failed} забитых задач 😅 Слушай, может тебе напоминания ставить, чтобы ты напоминания не забивал?",
+            "serious": f"Это {failed}-я невыполненная задача. Рекомендую пересмотреть подход.",
+        }
+        return roast.get(mode, "Понял.")
+
+    # Средний уровень
+    base = {
+        "toxic": f"Забил. Уже {failed}-й раз, если я правильно считаю. Может, пора что-то менять?",
+        "funny": f"Опять забил 😄 Ладно, не дёргаю. Но статистика у тебя растёт.",
+        "serious": f"Понял. Всего невыполненных: {failed}.",
+    }
+    return base.get(mode, "Понял.")
 
 
 # ---------- Парсеры времени ----------
@@ -259,6 +300,11 @@ SMART_PATTERN = re.compile(
 
 CANCEL_PATTERN = re.compile(
     r"^(отмени|убери|удали|забудь|сними)\s+(все\s+)?(напоминани[еяй]|задач[уи]|задани[ея])(\s+все)?\.?$",
+    re.IGNORECASE,
+)
+
+STATS_PATTERN = re.compile(
+    r"^(статистика|стата|моя стата|мой прогресс|сколько я забил|сколько забил|мои задачи)\b",
     re.IGNORECASE,
 )
 
@@ -303,6 +349,7 @@ async def cmd_start(message: Message):
         "• ⏰ *Напоминать* — «напомни через 30 минут позвонить маме» "
         "или «напомни завтра в 7 утра сделать зарядку»\n"
         "• 🗑 *Отменять* — «отмени напоминание»\n"
+        "• 📊 *Считать статистику* — «статистика»\n"
         "• 💬 *Болтать* — просто напиши мне что угодно, я отвечу\n"
         "• 🎭 *Менять характер* — у меня три режима настроения\n\n"
         f"Сейчас у тебя включён режим: *{current}*\n\n"
@@ -323,13 +370,14 @@ async def cmd_help(message: Message):
         "🗑 *Отмена*\n"
         "• «отмени напоминание» — покажу список и удалю\n"
         "• «отмени все напоминания» — снести всё\n\n"
+        "📊 *Статистика*\n"
+        "• «статистика» — покажу, сколько ты сделал и сколько забил\n\n"
         "💬 *Живое общение*\n"
         "Просто пиши мне как другу. Я помню контекст диалога.\n\n"
         "🎭 *Три режима настроения*\n"
         "😈 *Токсичный* — дерзкий и подкалываю\n"
         "🤪 *Угарный* — весёлый и тёплый\n"
-        "🧐 *Серьёзный* — спокойный и по делу\n\n"
-        "Меняй режим кнопками снизу.",
+        "🧐 *Серьёзный* — спокойный и по делу",
         parse_mode="Markdown",
     )
 
@@ -342,6 +390,61 @@ async def cmd_settings(message: Message):
         f"🎭 Текущий режим: *{current}*\n\n"
         f"Меняй режим кнопками снизу.\n\n"
         f"💎 Подписка пока в разработке — всё, что я умею, доступно бесплатно.",
+        parse_mode="Markdown",
+    )
+
+
+# ---- Статистика ----
+@dp.message(F.text.regexp(STATS_PATTERN))
+async def on_stats(message: Message):
+    user_id = message.from_user.id
+    mode = get_user_mode(user_id)
+    stats = get_user_stats(user_id)
+    done = stats.get("done", 0)
+    failed = stats.get("failed", 0)
+    cancelled = stats.get("cancelled", 0)
+    total = done + failed
+
+    if total == 0:
+        await message.answer(
+            "Статистика пустая — ты ещё ни одну задачу не завершил 🤷\n"
+            "Напиши «напомни через 5 минут сделать Х» и начнём."
+        )
+        return
+
+    percent = int(done * 100 / total) if total else 0
+
+    # Оценка в стиле режима
+    if mode == "toxic":
+        if percent >= 80:
+            verdict = f"{percent}% выполнения. Даже я в шоке. Неплохо, дисциплинированный ты наш."
+        elif percent >= 50:
+            verdict = f"{percent}% — средненько. Есть куда расти, не расслабляйся."
+        else:
+            verdict = f"{percent}% — так себе, если честно. Ты либо делаешь, либо забиваешь. Сейчас ты забиваешь."
+    elif mode == "funny":
+        if percent >= 80:
+            verdict = f"{percent}% — ты монстр продуктивности! 🚀"
+        elif percent >= 50:
+            verdict = f"{percent}% — нормально. Ни рыба ни мясо, но идёшь в правильном направлении 😎"
+        else:
+            verdict = f"{percent}% — ну, бывает. Зато не скучно живёшь 😅"
+    else:
+        if percent >= 80:
+            verdict = f"{percent}% выполнения. Отличный показатель."
+        elif percent >= 50:
+            verdict = f"{percent}% выполнения. Средний результат."
+        else:
+            verdict = f"{percent}% выполнения. Рекомендую повысить дисциплину."
+
+    await message.answer(
+        f"📊 *Твоя статистика:*\n\n"
+        f"✅ Сделано: *{done}*\n"
+        f"❌ Забито: *{failed}*\n"
+        f"🗑 Отменено: *{cancelled}*\n\n"
+        f"Всего задач с результатом: *{total}*\n"
+        f"Процент выполнения: *{percent}%*\n\n"
+        f"{verdict}",
         parse_mode="Markdown",
     )
 
@@ -533,13 +636,13 @@ async def handle_message(message: Message):
         if normalized in DONE_WORDS:
             mark_task_status(task_id, "done")
             del recent_reminders[user_id]
-            await message.answer(REACTION_DONE.get(mode, "Отлично!"))
+            await message.answer(reaction_done(user_id, mode))
             return
 
         if normalized in FAIL_WORDS:
             mark_task_status(task_id, "failed")
             del recent_reminders[user_id]
-            await message.answer(REACTION_FAIL.get(mode, "Понял."))
+            await message.answer(reaction_fail(user_id, mode))
             return
 
         del recent_reminders[user_id]
@@ -569,9 +672,13 @@ async def restore_pending_tasks():
         logging.info("Восстановлена задача #%s на %s", task["id"], remind_at)
 
 
-# ---------- Webhook-сервер ----------
+# ---------- Health-роут для UptimeRobot ----------
+async def health(request):
+    return web.Response(text="Bot is alive")
+
+
+# ---------- Webhook ----------
 async def on_startup(bot: Bot) -> None:
-    """Регистрируем webhook в Telegram при старте."""
     webhook_url = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
     await bot.set_webhook(
         url=webhook_url,
@@ -591,16 +698,11 @@ async def main():
     scheduler.start()
     await restore_pending_tasks()
 
-    # Отдельный поток для health-сервера (UptimeRobot)
-    import threading
-    threading.Thread(target=run_health_server, daemon=True).start()
-
-    # Регистрируем startup/shutdown
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    # aiohttp приложение для webhook
     app = web.Application()
+    app.router.add_get("/", health)
 
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
@@ -611,14 +713,12 @@ async def main():
 
     setup_application(app, dp, bot=bot)
 
-    # Запускаем на том же порту, что даёт Render
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logging.info("Webhook-сервер слушает порт %s", PORT)
+    logging.info("Сервер слушает порт %s (webhook + health)", PORT)
 
-    # Держим процесс живым
     await asyncio.Event().wait()
 
 
