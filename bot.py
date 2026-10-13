@@ -1,5 +1,5 @@
 """
-Бот-напоминалка с характером. Версия 6 — с живым общением через Groq.
+Бот-напоминалка с характером. Версия 7 — с показом ошибок Groq.
 """
 import os
 import re
@@ -43,10 +43,9 @@ scheduler = AsyncIOScheduler()
 
 # Клиент Groq
 groq_client = Groq(api_key=GROQ_API_KEY)
-GROQ_MODEL = "llama-3.3-70b-versatile"  # быстрая и умная бесплатная модель
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Память диалога: user_id -> список сообщений
-# Храним последние 20 сообщений, чтобы бот помнил контекст
+# Память диалога
 dialogue_memory: dict[int, list[dict]] = defaultdict(list)
 MAX_HISTORY = 20
 
@@ -121,10 +120,8 @@ SYSTEM_PROMPTS = {
 
 def ask_groq(user_id: int, user_message: str, mode: str) -> str:
     """Отправляет сообщение в Groq с учётом истории диалога и режима."""
-    # Добавляем сообщение пользователя в память
     dialogue_memory[user_id].append({"role": "user", "content": user_message})
 
-    # Обрезаем историю, чтобы не разрасталась
     history = dialogue_memory[user_id][-MAX_HISTORY:]
 
     try:
@@ -139,13 +136,12 @@ def ask_groq(user_id: int, user_message: str, mode: str) -> str:
         )
         answer = response.choices[0].message.content.strip()
     except Exception as e:
+        # Показываем ТОЧНУЮ ошибку, чтобы понять, что чинить
         logging.error("Ошибка Groq: %s", e)
-        answer = "Блин, что-то у меня связь пропала. Попробуй ещё раз."
+        answer = f"❌ Ошибка Groq: {type(e).__name__}: {e}"
 
-    # Сохраняем ответ бота в память
     dialogue_memory[user_id].append({"role": "assistant", "content": answer})
 
-    # Обрезаем память
     if len(dialogue_memory[user_id]) > MAX_HISTORY:
         dialogue_memory[user_id] = dialogue_memory[user_id][-MAX_HISTORY:]
 
@@ -199,7 +195,6 @@ async def cmd_start(message: Message):
 async def on_mode_button(message: Message):
     mode = MODE_BUTTONS[message.text]
     set_user_mode(message.from_user.id, mode)
-    # Очищаем память диалога при смене режима, чтобы бот не путался
     dialogue_memory[message.from_user.id].clear()
     await message.answer(MODE_REPLIES[mode], reply_markup=mode_keyboard())
 
