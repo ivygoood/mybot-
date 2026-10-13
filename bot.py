@@ -1,5 +1,5 @@
 """
-Бот-напоминалка. Версия 5 — с напоминаниями и режимами через кнопки.
+Бот-напоминалка с характером. Версия 6 — с живым общением через Groq.
 """
 import os
 import re
@@ -8,6 +8,7 @@ import logging
 import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -18,6 +19,7 @@ from aiogram.types import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+from groq import Groq
 
 from database import (
     init_db, get_user_mode, set_user_mode,
@@ -25,16 +27,28 @@ from database import (
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
+if not GROQ_API_KEY:
+    raise RuntimeError("Не задана переменная окружения GROQ_API_KEY")
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
+
+# Клиент Groq
+groq_client = Groq(api_key=GROQ_API_KEY)
+GROQ_MODEL = "llama-3.3-70b-versatile"  # быстрая и умная бесплатная модель
+
+# Память диалога: user_id -> список сообщений
+# Храним последние 20 сообщений, чтобы бот помнил контекст
+dialogue_memory: dict[int, list[dict]] = defaultdict(list)
+MAX_HISTORY = 20
 
 
 # ---------- Фейковый веб-сервер для Render ----------
@@ -82,11 +96,66 @@ MODE_REPLIES = {
 }
 
 
+# ---------- Системные промпты для трёх режимов ----------
+SYSTEM_PROMPTS = {
+    "toxic": (
+        "Ты — дерзкий, токсичный, но по-своему любящий кореш. Общаешься на 'ты', "
+        "по-пацански, коротко и хлёстко. Подкалываешь, но без реальных оскорблений и "
+        "без мата. Можешь назвать собеседника 'спортсмен', 'чемпион', 'герой', если это "
+        "к месту по контексту. Отвечай живо, 1-3 предложения, как в переписке с другом. "
+        "Не пиши как ассистент, не будь вежливым. Не пиши длинные абзацы."
+    ),
+    "funny": (
+        "Ты — весёлый, тёплый кореш с хорошим чувством юмора. Общаешься на 'ты', "
+        "по-дружески, с шутками и приколами. Поддерживаешь, но можешь и пошутить. "
+        "Отвечай коротко, 1-3 предложения, как в переписке с другом. "
+        "Не пиши как ассистент."
+    ),
+    "serious": (
+        "Ты — спокойный, собранный помощник. Общаешься на 'ты' или 'вы', "
+        "по делу, без лишних эмоций. Отвечай коротко, 1-3 предложения. "
+        "Не пиши как ассистент, не будь сухим роботом — просто спокойный и по делу."
+    ),
+}
+
+
+def ask_groq(user_id: int, user_message: str, mode: str) -> str:
+    """Отправляет сообщение в Groq с учётом истории диалога и режима."""
+    # Добавляем сообщение пользователя в память
+    dialogue_memory[user_id].append({"role": "user", "content": user_message})
+
+    # Обрезаем историю, чтобы не разрасталась
+    history = dialogue_memory[user_id][-MAX_HISTORY:]
+
+    try:
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["funny"])},
+                *history,
+            ],
+            temperature=0.9,
+            max_tokens=250,
+        )
+        answer = response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error("Ошибка Groq: %s", e)
+        answer = "Блин, что-то у меня связь пропала. Попробуй ещё раз."
+
+    # Сохраняем ответ бота в память
+    dialogue_memory[user_id].append({"role": "assistant", "content": answer})
+
+    # Обрезаем память
+    if len(dialogue_memory[user_id]) > MAX_HISTORY:
+        dialogue_memory[user_id] = dialogue_memory[user_id][-MAX_HISTORY:]
+
+    return answer
+
+
 # ---------- Тексты напоминаний по режимам ----------
-# {task} — подставляется текст задачи
 REMINDER_TEXTS = {
-    "toxic": "Слышь, спортсмен. Время вышло. «{task}». Ты либо делаешь, либо я записываю тебя в список тех, кто «начнёт с понедельника».",
-    "funny": "Бро. Время пришло. «{task}». Ты там уже начал или всё ещё в телефоне залипаешь?",
+    "toxic": "Ну что, {task}? Время вышло. Ты либо делаешь, либо забиваешь, как обычно. Решай.",
+    "funny": "Бро. Дзынь. «{task}» — само себя не сделает. Ну что там, погнали?",
     "serious": "Напоминаю: время вышло. Задача: «{task}».",
 }
 
@@ -105,7 +174,6 @@ REMIND_PATTERN = re.compile(
 
 
 def parse_time(amount: int, unit: str) -> tuple[timedelta, str]:
-    """Возвращает (дельта, человекочитаемое '1 минуту' / '2 часа')."""
     unit = unit.lower()
     if unit.startswith("мин"):
         return timedelta(minutes=amount), f"{amount} минут"
@@ -118,11 +186,11 @@ def parse_time(amount: int, unit: str) -> tuple[timedelta, str]:
 async def cmd_start(message: Message):
     current = get_user_mode(message.from_user.id)
     await message.answer(
-        f"Здорово, бро! Я твой кореш-напоминалка.\n"
+        f"Здорово, бро! Я твой кореш.\n"
         f"Текущий режим: *{current}*.\n\n"
-        f"Как пользоваться:\n"
-        f"• Тыкай кнопку снизу — меняешь стиль общения.\n"
-        f"• Пиши «напомни через 5 минут сделать пиццу» — я напомню.",
+        f"Можешь просто болтать со мной, а можешь попросить напомнить:\n"
+        f"«напомни через 5 минут сделать пиццу»\n\n"
+        f"Стиль общения меняется кнопками снизу.",
         reply_markup=mode_keyboard(),
     )
 
@@ -131,6 +199,8 @@ async def cmd_start(message: Message):
 async def on_mode_button(message: Message):
     mode = MODE_BUTTONS[message.text]
     set_user_mode(message.from_user.id, mode)
+    # Очищаем память диалога при смене режима, чтобы бот не путался
+    dialogue_memory[message.from_user.id].clear()
     await message.answer(MODE_REPLIES[mode], reply_markup=mode_keyboard())
 
 
@@ -148,7 +218,6 @@ async def on_reminder(message: Message):
     task_id = add_task(message.from_user.id, task_text, remind_at)
     mode = get_user_mode(message.from_user.id)
 
-    # Ставим задачу в планировщик
     scheduler.add_job(
         send_reminder,
         trigger=DateTrigger(run_date=remind_at),
@@ -162,7 +231,6 @@ async def on_reminder(message: Message):
 
 
 async def send_reminder(user_id: int, task_id: int, task_text: str, mode: str):
-    """Отправляет напоминание в стиле выбранного режима."""
     text = REMINDER_TEXTS.get(mode, "Напоминание: {task}").format(task=task_text)
     try:
         await bot.send_message(chat_id=user_id, text=text)
@@ -170,15 +238,16 @@ async def send_reminder(user_id: int, task_id: int, task_text: str, mode: str):
         logging.warning("Не смог отправить напоминание: %s", e)
 
 
-# ---- Эхо для всего остального ----
+# ---- Живое общение через Groq ----
 @dp.message(F.text)
-async def echo(message: Message):
-    await message.answer(message.text)
+async def chat_with_groq(message: Message):
+    mode = get_user_mode(message.from_user.id)
+    answer = ask_groq(message.from_user.id, message.text, mode)
+    await message.answer(answer)
 
 
 # ---------- Восстановление задач после перезапуска ----------
 async def restore_pending_tasks():
-    """Если Render перезапустил бота — задачи из БД снова встают в очередь."""
     for task in get_pending_tasks():
         remind_at = datetime.fromisoformat(task["remind_at"])
         if remind_at <= datetime.now():
