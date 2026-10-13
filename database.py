@@ -9,19 +9,14 @@ DB_PATH = "bot_data.db"
 
 
 def init_db() -> None:
-    """Создаёт таблицы: users и tasks."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-
-    # Режим пользователя
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             mode TEXT NOT NULL DEFAULT 'funny'
         )
     """)
-
-    # Задачи-напоминания
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,7 +55,6 @@ def set_user_mode(user_id: int, mode: str) -> None:
 # ---------- Задачи ----------
 
 def add_task(user_id: int, text: str, remind_at: datetime) -> int:
-    """Сохраняет задачу. Возвращает её id."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -73,13 +67,19 @@ def add_task(user_id: int, text: str, remind_at: datetime) -> int:
     return task_id
 
 
-def get_pending_tasks() -> list[dict]:
-    """Все невыполненные задачи. Нужно для восстановления после перезапуска."""
+def get_pending_tasks(user_id: Optional[int] = None) -> list[dict]:
+    """Все невыполненные задачи. Если указан user_id — только его."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute(
-        "SELECT id, user_id, text, remind_at FROM tasks WHERE status = 'pending'"
-    )
+    if user_id is None:
+        cur.execute(
+            "SELECT id, user_id, text, remind_at FROM tasks WHERE status = 'pending'"
+        )
+    else:
+        cur.execute(
+            "SELECT id, user_id, text, remind_at FROM tasks WHERE status = 'pending' AND user_id = ?",
+            (user_id,)
+        )
     rows = cur.fetchall()
     conn.close()
     return [
@@ -88,8 +88,24 @@ def get_pending_tasks() -> list[dict]:
     ]
 
 
+def get_task_by_id(task_id: int) -> Optional[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, user_id, text, remind_at, status FROM tasks WHERE id = ?",
+        (task_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0], "user_id": row[1], "text": row[2],
+        "remind_at": row[3], "status": row[4]
+    }
+
+
 def update_task_remind_at(task_id: int, remind_at: datetime) -> None:
-    """Сдвигает время задачи (для 'напомни ещё раз')."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -107,3 +123,17 @@ def mark_task_status(task_id: int, status: str) -> None:
     cur.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
     conn.commit()
     conn.close()
+
+
+def cancel_all_user_tasks(user_id: int) -> int:
+    """Отменяет ВСЕ активные задачи пользователя. Возвращает количество."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'",
+        (user_id,)
+    )
+    count = cur.rowcount
+    conn.commit()
+    conn.close()
+    return count
