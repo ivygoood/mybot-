@@ -1,12 +1,9 @@
 """
-Бот-напоминалка с характером. Версия 18:
-- /botstat — статистика для админа
-- /createpromo — создание промокодов для админа
-- /paysupport — поддержка по оплате (требование Telegram)
-- Промокоды через меню
-- Подписка за Telegram Stars (45 звёзд)
-- Лимиты: 10 чатов + 2 напоминания в день (Premium — безлимит)
-- Чистый чат без кнопок режимов, режимы — в /settings
+Бот-напоминалка с характером. Версия 19:
+- Фикс: allowed_updates для callback_query (кнопки Premium заработали)
+- /botstat теперь показывает Premium-пользователей
+- /paysupport — поддержка по оплате
+- Чистый чат + режимы в /settings
 """
 import os
 import re
@@ -43,7 +40,7 @@ from database import (
     is_premium, set_premium,
     get_limits, increment_chat_requests, increment_reminders,
     FREE_CHAT_LIMIT, FREE_REMINDER_LIMIT,
-    update_last_active, get_total_users, get_active_users,
+    update_last_active, get_total_users, get_active_users, get_premium_users,
     create_promocode, redeem_promocode,
 )
 
@@ -58,7 +55,6 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "my-super-secret-2026")
 # Telegram ID админов (число, без @ и букв)
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
-# Цена подписки в звёздах
 PREMIUM_PRICE_STARS = 45
 PREMIUM_DAYS = 30
 
@@ -93,7 +89,6 @@ MODE_BUTTONS = {
 
 
 def chat_keyboard() -> ReplyKeyboardMarkup:
-    """Чистая клавиатура для обычного чата — только кнопка настроек."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="⚙️ Настройки")],
@@ -104,7 +99,6 @@ def chat_keyboard() -> ReplyKeyboardMarkup:
 
 
 def settings_keyboard() -> ReplyKeyboardMarkup:
-    """Клавиатура внутри настроек — режимы + Premium + возврат."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="😈 Токсичный")],
@@ -126,7 +120,6 @@ MODE_REPLIES = {
 
 
 def premium_menu_keyboard() -> InlineKeyboardMarkup:
-    """Меню Premium: купить, промокод, инфо."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"⭐ Купить Premium ({PREMIUM_PRICE_STARS} звёзд)", callback_data="buy_premium")],
         [InlineKeyboardButton(text="🎁 Ввести промокод", callback_data="enter_promo")],
@@ -481,7 +474,7 @@ async def cmd_premium(message: Message):
 
 @dp.message(Command("paysupport"))
 async def cmd_paysupport(message: Message):
-    """Обязательная команда по требованиям Telegram для продажи цифровых товаров."""
+    """Обязательная команда по требованиям Telegram."""
     await message.answer(
         "💳 *Поддержка по оплате*\n\n"
         "Если у тебя возникли проблемы с оплатой Premium (звёзды списались, но доступ не пришёл) "
@@ -501,19 +494,20 @@ async def cmd_botstat(message: Message):
     total = get_total_users()
     active_1h = get_active_users(1)
     active_24h = get_active_users(24)
+    premium_count = get_premium_users()
 
     await message.answer(
         f"📊 *Статистика бота:*\n\n"
         f"👥 Всего пользователей: *{total}*\n"
         f"🟢 Активных за час: *{active_1h}*\n"
-        f"📅 Активных за 24 часа: *{active_24h}*",
+        f"📅 Активных за 24 часа: *{active_24h}*\n"
+        f"💎 С Premium: *{premium_count}*",
         parse_mode="Markdown",
     )
 
 
 @dp.message(Command("createpromo"))
 async def cmd_createpromo(message: Message):
-    """Использование: /createpromo CODE [дни]"""
     if not is_admin(message.from_user.id):
         await message.answer("Эта команда только для админа 🤷")
         return
@@ -593,7 +587,7 @@ async def on_stats(message: Message):
     )
 
 
-# ---- Кнопки режимов (только в настройках) ----
+# ---- Кнопки режимов ----
 @dp.message(F.text.in_(MODE_BUTTONS.keys()))
 async def on_mode_button(message: Message):
     update_last_active(message.from_user.id)
@@ -605,7 +599,6 @@ async def on_mode_button(message: Message):
     await message.answer(MODE_REPLIES[mode], reply_markup=settings_keyboard())
 
 
-# ---- Кнопки меню ----
 @dp.message(F.text == "⚙️ Настройки")
 async def on_settings_button(message: Message):
     await cmd_settings(message)
@@ -625,7 +618,7 @@ async def on_premium_button(message: Message):
     await cmd_premium(message)
 
 
-# ---- Меню Premium: обработка кнопок ----
+# ---- Меню Premium ----
 @dp.callback_query(F.data == "premium_info")
 async def cb_premium_info(callback: CallbackQuery):
     await callback.message.answer(
@@ -646,15 +639,14 @@ async def cb_buy_premium(callback: CallbackQuery):
         await callback.answer()
         return
 
-    # Создаём счёт на оплату звёздами (XTR + пустой provider_token)
     try:
         await bot.send_invoice(
             chat_id=callback.from_user.id,
             title="Мой Кореш Premium",
             description=f"Безлимит запросов и напоминаний на {PREMIUM_DAYS} дней",
             payload=f"premium_{callback.from_user.id}_{PREMIUM_DAYS}",
-            provider_token="",   # для звёзд пустой
-            currency="XTR",      # XTR — код Telegram Stars
+            provider_token="",
+            currency="XTR",
             prices=[LabeledPrice(label="Premium", amount=PREMIUM_PRICE_STARS)],
         )
     except Exception as e:
@@ -676,7 +668,7 @@ async def cb_enter_promo(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---- Обработка оплаты Stars ----
+# ---- Оплата Stars ----
 @dp.pre_checkout_query()
 async def on_pre_checkout(pre_checkout_q: PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
@@ -884,7 +876,7 @@ async def send_reminder(user_id: int, task_id: int, task_text: str, mode: str):
         logging.warning("Не смог отправить напоминание: %s", e)
 
 
-# ---- Основной чат (с лимитами и промокодами) ----
+# ---- Основной чат ----
 async def route_to_chat(message: Message):
     user_id = message.from_user.id
     mode = get_user_mode(user_id)
@@ -982,6 +974,8 @@ async def on_startup(bot: Bot) -> None:
         url=webhook_url,
         secret_token=WEBHOOK_SECRET,
         drop_pending_updates=True,
+        # КРИТИЧНО: без callback_query inline-кнопки не работают
+        allowed_updates=["message", "callback_query", "pre_checkout_query"],
     )
     logging.info("Webhook установлен: %s", webhook_url)
 
