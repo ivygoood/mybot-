@@ -1,11 +1,10 @@
 """
-Бот-напоминалка с характером. Версия 16:
-- Webhook вместо Polling (без ошибок Conflict)
-- Один сервер: / для UptimeRobot + /webhook для Telegram
-- Счётчик "сливов": бот считает, сколько раз ты забил, и подкалывает
-- Запрет "спортсмен"/"чемпион"/"герой"
-- Отмена напоминаний
-- "напомни мне через минуту" работает
+Бот-напоминалка с характером. Версия 17:
+- /botstat — статистика для админа
+- /createpromo — создание промокодов для админа
+- Промокоды через меню
+- Подписка за Telegram Stars (45 звёзд)
+- Лимиты: 10 чатов + 2 напоминания в день (Premium — безлимит)
 """
 import os
 import re
@@ -23,6 +22,11 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    LabeledPrice,
+    PreCheckoutQuery,
+    CallbackQuery,
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -33,17 +37,28 @@ from database import (
     init_db, get_user_mode, set_user_mode,
     add_task, get_pending_tasks, get_task_by_id,
     update_task_remind_at, mark_task_status, cancel_all_user_tasks,
-    get_user_stats, get_user_stats_by_period,
+    get_user_stats,
+    is_premium, set_premium,
+    get_limits, increment_chat_requests, increment_reminders,
+    FREE_CHAT_LIMIT, FREE_REMINDER_LIMIT,
+    update_last_active, get_total_users, get_active_users,
+    create_promocode, redeem_promocode,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Render даёт URL автоматически — база для webhook
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://mybot-ba32.onrender.com")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "my-super-secret-2026")
+
+# Telegram ID админов (тебе выдаст @userinfobot)
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+
+# Цена подписки в звёздах
+PREMIUM_PRICE_STARS = 45
+PREMIUM_DAYS = 30
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
@@ -64,9 +79,11 @@ MAX_HISTORY = 20
 
 recent_reminders: dict[int, dict] = {}
 pending_cancel: dict[int, list[dict]] = {}
+# Ожидание ввода промокода
+awaiting_promo: set[int] = set()
 
 
-# ---------- Клавиатура ----------
+# ---------- Клавиатуры ----------
 MODE_BUTTONS = {
     "😈 Токсичный": "toxic",
     "🤪 Угарный": "funny",
@@ -74,12 +91,14 @@ MODE_BUTTONS = {
 }
 
 
-def mode_keyboard() -> ReplyKeyboardMarkup:
+def main_keyboard() -> ReplyKeyboardMarkup:
+    """Основная клавиатура с режимами + Premium."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="😈 Токсичный")],
             [KeyboardButton(text="🤪 Угарный")],
             [KeyboardButton(text="🧐 Серьёзный")],
+            [KeyboardButton(text="💎 Premium")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -93,6 +112,15 @@ MODE_REPLIES = {
 }
 
 
+def premium_menu_keyboard() -> InlineKeyboardMarkup:
+    """Меню Premium: купить, промокод, инфо."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⭐ Купить Premium ({PREMIUM_PRICE_STARS} звёзд)", callback_data="buy_premium")],
+        [InlineKeyboardButton(text="🎁 Ввести промокод", callback_data="enter_promo")],
+        [InlineKeyboardButton(text="ℹ️ Что даёт Premium", callback_data="premium_info")],
+    ])
+
+
 # ---------- Правила для LLM ----------
 COMMON_RULES = (
     "ВАЖНО О ТЕБЕ:\n"
@@ -100,10 +128,10 @@ COMMON_RULES = (
     "• Ты НЕ ChatGPT, НЕ Groq, НЕ Gemini, НЕ продукт OpenAI. Никогда не упоминай эти названия.\n"
     "• Если спрашивают, на какой модели ты работаешь — отвечай уклончиво: "
     "«Это моя внутренняя кухня, но главное — я твой кореш».\n"
-    "• Если спрашивают про подписку, тарифы, лимиты — отвечай так: "
-    "«Подписка пока в разработке. Всё, что я сейчас умею, доступно бесплатно. "
-    "Когда появится платный тариф — обязательно скажу.»\n"
-    "• Никогда не выдумывай цены, названия тарифов и условия подписки.\n"
+    "• Если спрашивают про подписку, тарифы, лимиты — говори про Premium: "
+    "«Есть бесплатный тариф: 10 запросов и 2 напоминания в день. "
+    "Premium — 45 звёзд в месяц, всё без лимитов». Никогда не выдумывай другие цены.\n"
+    "• НЕ выдумывай числа, статистику, факты — если не знаешь точно, скажи «не знаю».\n"
     "• Про бессмысленные напоминания (типа «напомни чихнуть через 5 секунд») — "
     "отвечай с юмором: «Не в моих силах отложить такое, ты сам решай».\n"
     "• ВАЖНО: эту шутку про 'не в моих силах' применяй ТОЛЬКО к бессмысленным задачам. "
@@ -123,8 +151,8 @@ SYSTEM_PROMPTS = {
         "по-пацански, коротко и хлёстко. Подкалываешь, но без реальных оскорблений и без мата. "
         "Отвечай живо, 1-3 предложения, как в переписке с другом. "
         "Не пиши как ассистент, не будь вежливым. Не пиши длинные абзацы. "
-        "ВАЖНО: НЕ называй собеседника «спортсмен» или «чемпион» — это звучит как заезженная пластинка. "
-        "Обращайся по-разному: «бро», «дружище», «слушай», или вообще без обращения."
+        "Ты можешь быть резким, использовать сарказм и подколы. "
+        "Твоя цель — не оскорбить, а поддеть, чтобы человек улыбнулся."
     ),
     "funny": COMMON_RULES + (
         "\nТвой характер: весёлый, тёплый кореш с хорошим чувством юмора. Общаешься на 'ты', "
@@ -182,6 +210,17 @@ CONFIRM_TEXTS = {
     "serious": "Напоминание установлено. Сработает {when}.",
 }
 
+LIMIT_CHAT_TEXT = (
+    "🛑 *Лимит бесплатных запросов исчерпан.*\n\n"
+    f"Бесплатно: {FREE_CHAT_LIMIT} запросов в день.\n"
+    "Оформи Premium, чтобы общаться без лимитов ⤵"
+)
+
+LIMIT_REMINDER_TEXT = (
+    "🛑 *Лимит бесплатных напоминаний исчерпан.*\n\n"
+    f"Бесплатно: {FREE_REMINDER_LIMIT} напоминания в день.\n"
+    "Оформи Premium, чтобы ставить сколько нужно ⤵"
+)
 
 DONE_WORDS = {
     "сделал", "сделала", "сделано", "готово", "выполнил", "выполнено",
@@ -204,15 +243,12 @@ def normalize_answer(text: str) -> str:
     return text.strip()
 
 
-# ---------- Умные реакции на "сделал"/"забил" в зависимости от статистики ----------
 def reaction_done(user_id: int, mode: str) -> str:
-    """Возвращает фразу на 'сделал' с учётом статистики."""
     stats = get_user_stats(user_id)
     done = stats.get("done", 0)
     failed = stats.get("failed", 0)
     total = done + failed
 
-    # Если это первая-вторая задача — базовая похвала
     if total <= 2:
         base = {
             "toxic": "О, неужели. Не ожидал. Держи пять, но не расслабляйся.",
@@ -221,16 +257,14 @@ def reaction_done(user_id: int, mode: str) -> str:
         }
         return base.get(mode, "Отлично!")
 
-    # Если выполнено много — хвалим сильнее
     if done >= 5 and done > failed:
         praise = {
-            "toxic": f"Опа, {done} задач закрыто. Я в шоке, если честно. Продолжай, и может из тебя выйдет толк.",
-            "funny": f"Слушай, {done} задач — это уже не случайность, это система! Горжусь тобой 😎",
-            "serious": f"Отличный результат. {done} выполненных задач. Так держать.",
+            "toxic": f"Опа, {done} задач закрыто. Я в шоке. Продолжай, может из тебя выйдет толк.",
+            "funny": f"Слушай, {done} задач — это уже система! Горжусь тобой 😎",
+            "serious": f"Отличный результат. {done} выполненных задач.",
         }
         return praise.get(mode, "Отлично!")
 
-    # Обычная похвала
     base = {
         "toxic": "Сделал. Ну наконец-то. Следующая задача сама себя не сделает.",
         "funny": "Красава! Что там у нас дальше? 😎",
@@ -240,33 +274,29 @@ def reaction_done(user_id: int, mode: str) -> str:
 
 
 def reaction_fail(user_id: int, mode: str) -> str:
-    """Возвращает фразу на 'забил' с учётом статистики."""
     stats = get_user_stats(user_id)
     failed = stats.get("failed", 0)
     done = stats.get("done", 0)
 
-    # Если забил впервые — мягко
     if failed == 1:
         base = {
-            "toxic": "Ну конечно. Классика жанра. «Я сегодня устал, завтра точно». Записал как забил.",
+            "toxic": "Ну конечно. Классика жанра. «Я сегодня устал, завтра точно».",
             "funny": "Ну классика. Записал как забил, больше не дёргаю 😄",
             "serious": "Понял. Задача отмечена как невыполненная.",
         }
         return base.get(mode, "Понял.")
 
-    # Если забивает часто — усиливаем
     if failed >= 5 and failed > done:
         roast = {
-            "toxic": f"Уже {failed} задач забито. Ты вообще собирался что-то делать или так, для галочки мне написал?",
-            "funny": f"{failed} забитых задач 😅 Слушай, может тебе напоминания ставить, чтобы ты напоминания не забивал?",
+            "toxic": f"Уже {failed} задач забито. Ты вообще собирался что-то делать?",
+            "funny": f"{failed} забитых задач 😅 Может тебе напоминания ставить, чтобы ты напоминания не забивал?",
             "serious": f"Это {failed}-я невыполненная задача. Рекомендую пересмотреть подход.",
         }
         return roast.get(mode, "Понял.")
 
-    # Средний уровень
     base = {
-        "toxic": f"Забил. Уже {failed}-й раз, если я правильно считаю. Может, пора что-то менять?",
-        "funny": f"Опять забил 😄 Ладно, не дёргаю. Но статистика у тебя растёт.",
+        "toxic": f"Забил. Уже {failed}-й раз. Может, пора что-то менять?",
+        "funny": f"Опять забил 😄 Ладно, не дёргаю. Но статистика растёт.",
         "serious": f"Понял. Всего невыполненных: {failed}.",
     }
     return base.get(mode, "Понял.")
@@ -304,9 +334,11 @@ CANCEL_PATTERN = re.compile(
 )
 
 STATS_PATTERN = re.compile(
-    r"^(статистика|стата|моя стата|мой прогресс|сколько я забил|сколько забил|мои задачи)\b",
+    r"(статистик|стата|стату|мой прогресс|моя стат|сколько я забил|сколько забил|мои задачи|мою стату)",
     re.IGNORECASE,
 )
+
+PROMO_INPUT_PATTERN = re.compile(r"^[A-Z0-9]{4,20}$", re.IGNORECASE)
 
 
 def parse_simple_time(amount: int, unit: str) -> tuple[datetime, str]:
@@ -338,65 +370,156 @@ def format_task_list(tasks: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
 # ---------- Хендлеры ----------
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    update_last_active(message.from_user.id)
     current = get_user_mode(message.from_user.id)
+    premium = is_premium(message.from_user.id)
+    badge = "💎 Premium" if premium else "🆓 Бесплатный"
+
     await message.answer(
         "👋 *Здорово, бро! Я твой кореш.*\n\n"
         "Что я умею:\n"
-        "• ⏰ *Напоминать* — «напомни через 30 минут позвонить маме» "
-        "или «напомни завтра в 7 утра сделать зарядку»\n"
+        "• ⏰ *Напоминать* — «напомни через 30 минут позвонить маме»\n"
         "• 🗑 *Отменять* — «отмени напоминание»\n"
         "• 📊 *Считать статистику* — «статистика»\n"
-        "• 💬 *Болтать* — просто напиши мне что угодно, я отвечу\n"
-        "• 🎭 *Менять характер* — у меня три режима настроения\n\n"
-        f"Сейчас у тебя включён режим: *{current}*\n\n"
+        "• 💬 *Болтать* — просто напиши мне\n\n"
+        f"Текущий режим: *{current}*\n"
+        f"Тариф: *{badge}*\n\n"
         "Выбирай стиль кнопками снизу или жми /help.",
-        reply_markup=mode_keyboard(),
+        reply_markup=main_keyboard(),
         parse_mode="Markdown",
     )
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
+    update_last_active(message.from_user.id)
     await message.answer(
         "🤝 *Что я умею:*\n\n"
         "⏰ *Напоминания*\n"
         "• «напомни через 5 минут сделать пиццу»\n"
         "• «напомни мне через минуту позвонить»\n"
         "• «напомни завтра в 7 утра сделать зарядку»\n\n"
-        "🗑 *Отмена*\n"
-        "• «отмени напоминание» — покажу список и удалю\n"
-        "• «отмени все напоминания» — снести всё\n\n"
-        "📊 *Статистика*\n"
-        "• «статистика» — покажу, сколько ты сделал и сколько забил\n\n"
-        "💬 *Живое общение*\n"
-        "Просто пиши мне как другу. Я помню контекст диалога.\n\n"
-        "🎭 *Три режима настроения*\n"
-        "😈 *Токсичный* — дерзкий и подкалываю\n"
-        "🤪 *Угарный* — весёлый и тёплый\n"
-        "🧐 *Серьёзный* — спокойный и по делу",
+        "🗑 *Отмена* — «отмени напоминание»\n\n"
+        "📊 *Статистика* — «статистика»\n\n"
+        "💬 *Живое общение* — просто пиши как другу\n\n"
+        "💎 *Premium* — /premium\n\n"
+        "🎭 *Режимы:* 😈 Токсичный / 🤪 Угарный / 🧐 Серьёзный",
         parse_mode="Markdown",
     )
 
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
+    update_last_active(message.from_user.id)
     current = get_user_mode(message.from_user.id)
+    premium = is_premium(message.from_user.id)
+    limits = get_limits(message.from_user.id)
+
+    if premium:
+        limit_line = "💎 Premium — *безлимит*"
+    else:
+        limit_line = (
+            f"🆓 Бесплатный тариф:\n"
+            f"• Запросы: *{limits['chat_requests']}/{FREE_CHAT_LIMIT}*\n"
+            f"• Напоминания: *{limits['reminders_created']}/{FREE_REMINDER_LIMIT}*"
+        )
+
     await message.answer(
         f"⚙️ *Настройки*\n\n"
-        f"🎭 Текущий режим: *{current}*\n\n"
-        f"Меняй режим кнопками снизу.\n\n"
-        f"💎 Подписка пока в разработке — всё, что я умею, доступно бесплатно.",
+        f"🎭 Режим: *{current}*\n\n"
+        f"{limit_line}",
         parse_mode="Markdown",
     )
 
 
-# ---- Статистика ----
+@dp.message(Command("premium"))
+async def cmd_premium(message: Message):
+    update_last_active(message.from_user.id)
+    premium = is_premium(message.from_user.id)
+
+    if premium:
+        await message.answer(
+            "💎 *У тебя уже активен Premium.*\n\nСпасибо за поддержку, бро! 🤝",
+            parse_mode="Markdown",
+        )
+        return
+
+    await message.answer(
+        "💎 *Premium*\n\n"
+        f"Цена: *{PREMIUM_PRICE_STARS} звёзд* в месяц.\n\n"
+        "Что даёт:\n"
+        "• ♾ Безлимит запросов к боту\n"
+        "• ♾ Безлимит напоминаний\n"
+        "• 🚀 Поддержка проекта\n\n"
+        "Выбирай:",
+        reply_markup=premium_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("botstat"))
+async def cmd_botstat(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Эта команда только для админа 🤷")
+        return
+
+    total = get_total_users()
+    active_1h = get_active_users(1)
+    active_24h = get_active_users(24)
+
+    await message.answer(
+        f"📊 *Статистика бота:*\n\n"
+        f"👥 Всего пользователей: *{total}*\n"
+        f"🟢 Активных за час: *{active_1h}*\n"
+        f"📅 Активных за 24 часа: *{active_24h}*",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("createpromo"))
+async def cmd_createpromo(message: Message):
+    """Использование: /createpromo CODE [дни]"""
+    if not is_admin(message.from_user.id):
+        await message.answer("Эта команда только для админа 🤷")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "Использование:\n"
+            "`/createpromo КОД [дни]`\n\n"
+            "Пример: `/createpromo BRO2026 30`",
+            parse_mode="Markdown",
+        )
+        return
+
+    code = parts[1].upper().strip()
+    days = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
+
+    try:
+        create_promocode(code, days)
+        await message.answer(
+            f"✅ Промокод создан:\n\n"
+            f"• Код: `{code}`\n"
+            f"• Дней Premium: *{days}*",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+# ---- Статистика пользователя ----
 @dp.message(F.text.regexp(STATS_PATTERN))
 async def on_stats(message: Message):
+    update_last_active(message.from_user.id)
     user_id = message.from_user.id
     mode = get_user_mode(user_id)
     stats = get_user_stats(user_id)
@@ -414,60 +537,129 @@ async def on_stats(message: Message):
 
     percent = int(done * 100 / total) if total else 0
 
-    # Оценка в стиле режима
     if mode == "toxic":
         if percent >= 80:
-            verdict = f"{percent}% выполнения. Даже я в шоке. Неплохо, дисциплинированный ты наш."
+            verdict = f"{percent}% выполнения. Даже я в шоке. Неплохо."
         elif percent >= 50:
-            verdict = f"{percent}% — средненько. Есть куда расти, не расслабляйся."
+            verdict = f"{percent}% — средненько. Есть куда расти."
         else:
-            verdict = f"{percent}% — так себе, если честно. Ты либо делаешь, либо забиваешь. Сейчас ты забиваешь."
+            verdict = f"{percent}% — так себе. Ты либо делаешь, либо забиваешь."
     elif mode == "funny":
         if percent >= 80:
             verdict = f"{percent}% — ты монстр продуктивности! 🚀"
         elif percent >= 50:
-            verdict = f"{percent}% — нормально. Ни рыба ни мясо, но идёшь в правильном направлении 😎"
+            verdict = f"{percent}% — нормально, идёшь в правильном направлении 😎"
         else:
-            verdict = f"{percent}% — ну, бывает. Зато не скучно живёшь 😅"
+            verdict = f"{percent}% — ну, бывает. Зато не скучно 😅"
     else:
-        if percent >= 80:
-            verdict = f"{percent}% выполнения. Отличный показатель."
-        elif percent >= 50:
-            verdict = f"{percent}% выполнения. Средний результат."
-        else:
-            verdict = f"{percent}% выполнения. Рекомендую повысить дисциплину."
+        verdict = f"{percent}% выполнения."
 
     await message.answer(
         f"📊 *Твоя статистика:*\n\n"
         f"✅ Сделано: *{done}*\n"
         f"❌ Забито: *{failed}*\n"
         f"🗑 Отменено: *{cancelled}*\n\n"
-        f"Всего задач с результатом: *{total}*\n"
-        f"Процент выполнения: *{percent}%*\n\n"
+        f"Всего: *{total}*\n"
+        f"Процент: *{percent}%*\n\n"
         f"{verdict}",
         parse_mode="Markdown",
     )
 
 
+# ---- Кнопки режимов ----
 @dp.message(F.text.in_(MODE_BUTTONS.keys()))
 async def on_mode_button(message: Message):
+    update_last_active(message.from_user.id)
     mode = MODE_BUTTONS[message.text]
     set_user_mode(message.from_user.id, mode)
     dialogue_memory[message.from_user.id].clear()
     recent_reminders.pop(message.from_user.id, None)
     pending_cancel.pop(message.from_user.id, None)
-    await message.answer(MODE_REPLIES[mode], reply_markup=mode_keyboard())
+    await message.answer(MODE_REPLIES[mode], reply_markup=main_keyboard())
 
 
+# ---- Кнопка Premium ----
+@dp.message(F.text == "💎 Premium")
+async def on_premium_button(message: Message):
+    update_last_active(message.from_user.id)
+    await cmd_premium(message)
+
+
+# ---- Меню Premium: обработка кнопок ----
+@dp.callback_query(F.data == "premium_info")
+async def cb_premium_info(callback: CallbackQuery):
+    await callback.message.answer(
+        "💎 *Что даёт Premium:*\n\n"
+        "• ♾ Безлимит запросов к боту\n"
+        "• ♾ Безлимит напоминаний\n"
+        "• 🚀 Поддержка проекта\n\n"
+        f"Цена: *{PREMIUM_PRICE_STARS} звёзд* в месяц.",
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "buy_premium")
+async def cb_buy_premium(callback: CallbackQuery):
+    if is_premium(callback.from_user.id):
+        await callback.message.answer("💎 У тебя уже активен Premium.")
+        await callback.answer()
+        return
+
+    # Создаём счёт на оплату звёздами
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title="Мой Кореш Premium",
+        description=f"Безлимит запросов и напоминаний на {PREMIUM_DAYS} дней",
+        payload=f"premium_{callback.from_user.id}_{PREMIUM_DAYS}",
+        provider_token="",  # для звёзд пустой
+        currency="XTR",     # XTR — код Telegram Stars
+        prices=[LabeledPrice(label="Premium", amount=PREMIUM_PRICE_STARS)],
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "enter_promo")
+async def cb_enter_promo(callback: CallbackQuery):
+    awaiting_promo.add(callback.from_user.id)
+    await callback.message.answer(
+        "🎁 *Введи промокод.*\n\n"
+        "Просто отправь его следующим сообщением. Например: `BRO2026`",
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+# ---- Обработка оплаты Stars ----
+@dp.pre_checkout_query()
+async def on_pre_checkout(pre_checkout_q: PreCheckoutQuery):
+    """Подтверждаем платёж — обязательный шаг."""
+    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(message: Message):
+    """Платёж прошёл — выдаём Premium."""
+    user_id = message.from_user.id
+    set_premium(user_id, True, PREMIUM_DAYS)
+    await message.answer(
+        f"💎 *Premium активирован!*\n\n"
+        f"Спасибо, бро! Теперь у тебя безлимит на {PREMIUM_DAYS} дней. 🤝",
+        parse_mode="Markdown",
+    )
+
+
+# ---- Отмена напоминаний ----
 @dp.message(F.text.regexp(CANCEL_PATTERN))
 async def on_cancel_request(message: Message):
+    update_last_active(message.from_user.id)
     user_id = message.from_user.id
     text_lower = message.text.lower()
 
     if "все" in text_lower or "всё" in text_lower:
         count = cancel_all_user_tasks(user_id)
         if count == 0:
-            await message.answer("У тебя и так пусто, отменять нечего 🤷")
+            await message.answer("У тебя и так пусто 🤷")
         else:
             for task in get_pending_tasks():
                 if task["user_id"] == user_id:
@@ -475,7 +667,7 @@ async def on_cancel_request(message: Message):
                         scheduler.remove_job(f"task_{task['id']}")
                     except Exception:
                         pass
-            await message.answer(f"Ок, снёс все напоминания ({count} шт.). Начнём с чистого листа.")
+            await message.answer(f"Ок, снёс все напоминания ({count} шт.).")
         return
 
     tasks = get_pending_tasks(user_id=user_id)
@@ -497,17 +689,17 @@ async def on_cancel_request(message: Message):
     listing = format_task_list(tasks)
     await message.answer(
         f"Активные напоминания:\n\n{listing}\n\n"
-        f"Напиши номер, чтобы отменить. Или «отмени всё»."
+        f"Напиши номер. Или «отмени всё»."
     )
 
 
 @dp.message(F.text.regexp(r"^\d+$"))
 async def on_cancel_number(message: Message):
+    update_last_active(message.from_user.id)
     user_id = message.from_user.id
     if user_id not in pending_cancel:
-        mode = get_user_mode(user_id)
-        answer = ask_groq(user_id, message.text, mode)
-        await message.answer(answer)
+        # Может быть промокод из цифр? Маловероятно, идём в чат
+        await route_to_chat(message)
         return
 
     tasks = pending_cancel[user_id]
@@ -516,7 +708,7 @@ async def on_cancel_number(message: Message):
         if idx < 0 or idx >= len(tasks):
             raise IndexError
     except (ValueError, IndexError):
-        await message.answer(f"Нет такого номера. У тебя {len(tasks)} задач(и). Напиши от 1 до {len(tasks)}.")
+        await message.answer(f"Нет такого номера. У тебя {len(tasks)} задач.")
         return
 
     task = tasks[idx]
@@ -529,8 +721,26 @@ async def on_cancel_number(message: Message):
     await message.answer(f"Ок, убрал напоминание про «{task['text']}».")
 
 
+# ---- Напоминания ----
+def check_reminder_limit(user_id: int) -> bool:
+    """True если можно создавать, False если лимит."""
+    if is_premium(user_id):
+        return True
+    limits = get_limits(user_id)
+    return limits["reminders_created"] < FREE_REMINDER_LIMIT
+
+
+async def reminder_limit_response(message: Message):
+    await message.answer(LIMIT_REMINDER_TEXT, reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
+
+
 @dp.message(F.text.regexp(WORD_TIME_PATTERN))
 async def on_reminder_word(message: Message):
+    update_last_active(message.from_user.id)
+    if not check_reminder_limit(message.from_user.id):
+        await reminder_limit_response(message)
+        return
+
     match = WORD_TIME_PATTERN.search(message.text)
     word = match.group(1).lower()
     task_text = match.group(2).strip()
@@ -539,6 +749,7 @@ async def on_reminder_word(message: Message):
     remind_at = datetime.now() + delta
 
     task_id = add_task(message.from_user.id, task_text, remind_at)
+    increment_reminders(message.from_user.id)
     mode = get_user_mode(message.from_user.id)
 
     scheduler.add_job(
@@ -555,6 +766,11 @@ async def on_reminder_word(message: Message):
 
 @dp.message(F.text.regexp(SIMPLE_PATTERN))
 async def on_reminder_simple(message: Message):
+    update_last_active(message.from_user.id)
+    if not check_reminder_limit(message.from_user.id):
+        await reminder_limit_response(message)
+        return
+
     match = SIMPLE_PATTERN.search(message.text)
     amount = int(match.group(1))
     unit = match.group(2)
@@ -562,6 +778,7 @@ async def on_reminder_simple(message: Message):
 
     remind_at, when_human = parse_simple_time(amount, unit)
     task_id = add_task(message.from_user.id, task_text, remind_at)
+    increment_reminders(message.from_user.id)
     mode = get_user_mode(message.from_user.id)
 
     scheduler.add_job(
@@ -578,6 +795,11 @@ async def on_reminder_simple(message: Message):
 
 @dp.message(F.text.regexp(SMART_PATTERN))
 async def on_reminder_smart(message: Message):
+    update_last_active(message.from_user.id)
+    if not check_reminder_limit(message.from_user.id):
+        await reminder_limit_response(message)
+        return
+
     match = SMART_PATTERN.search(message.text)
     time_text = match.group(1).strip()
     verb = match.group(2).strip()
@@ -588,14 +810,15 @@ async def on_reminder_smart(message: Message):
     if remind_at is None:
         mode = get_user_mode(message.from_user.id)
         fallback = {
-            "toxic": "Не понял, когда напомнить. Скажи нормально, например: «напомни через 30 минут...».",
+            "toxic": "Не понял, когда напомнить. Скажи нормально.",
             "funny": "Чёт не догнал время. Напиши типа «напомни через 30 минут сделать Х» 😄",
-            "serious": "Не удалось распознать время. Уточните: «напомни через 30 минут...».",
+            "serious": "Не удалось распознать время.",
         }
         await message.answer(fallback.get(mode, "Не понял время."))
         return
 
     task_id = add_task(message.from_user.id, task_text, remind_at)
+    increment_reminders(message.from_user.id)
     mode = get_user_mode(message.from_user.id)
 
     scheduler.add_job(
@@ -619,8 +842,9 @@ async def send_reminder(user_id: int, task_id: int, task_text: str, mode: str):
         logging.warning("Не смог отправить напоминание: %s", e)
 
 
-@dp.message(F.text)
-async def handle_message(message: Message):
+# ---- Основной чат (с проверкой лимитов и промокодов) ----
+async def route_to_chat(message: Message):
+    """Отправляет сообщение в LLM с учётом лимита."""
     user_id = message.from_user.id
     mode = get_user_mode(user_id)
     normalized = normalize_answer(message.text)
@@ -647,12 +871,51 @@ async def handle_message(message: Message):
 
         del recent_reminders[user_id]
         context = f"Только что было напоминание по задаче: «{task_text}». Пользователь отвечает нестандартно."
+        # Запрос к LLM = расход лимита
+        if not is_premium(user_id):
+            current = increment_chat_requests(user_id)
+            if current > FREE_CHAT_LIMIT:
+                await message.answer(LIMIT_CHAT_TEXT, reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
+                return
         answer = ask_groq(user_id, message.text, mode, extra_context=context)
         await message.answer(answer)
         return
 
+    # Обычный чат — проверяем лимит
+    if not is_premium(user_id):
+        current = increment_chat_requests(user_id)
+        if current > FREE_CHAT_LIMIT:
+            await message.answer(LIMIT_CHAT_TEXT, reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
+            return
+
     answer = ask_groq(user_id, message.text, mode)
     await message.answer(answer)
+
+
+@dp.message(F.text)
+async def handle_message(message: Message):
+    user_id = message.from_user.id
+    update_last_active(user_id)
+
+    # 1. Если пользователь вводит промокод
+    if user_id in awaiting_promo:
+        code = message.text.strip().upper()
+        # Простейшая валидация формата
+        if not re.match(r"^[A-Z0-9\-]{4,20}$", code):
+            await message.answer(
+                "Хм, это не похоже на промокод. Попробуй ещё раз или жми /premium чтобы выйти."
+            )
+            return
+        awaiting_promo.discard(user_id)
+        success, msg = redeem_promocode(user_id, code)
+        if success:
+            await message.answer(f"✅ {msg}\n\nНаслаждайся безлимитом, бро! 🤝")
+        else:
+            await message.answer(f"❌ {msg}")
+        return
+
+    # 2. Всё остальное — в основной чат
+    await route_to_chat(message)
 
 
 # ---------- Восстановление задач ----------
@@ -672,12 +935,11 @@ async def restore_pending_tasks():
         logging.info("Восстановлена задача #%s на %s", task["id"], remind_at)
 
 
-# ---------- Health-роут для UptimeRobot ----------
+# ---------- Health + Webhook ----------
 async def health(request):
     return web.Response(text="Bot is alive")
 
 
-# ---------- Webhook ----------
 async def on_startup(bot: Bot) -> None:
     webhook_url = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
     await bot.set_webhook(
