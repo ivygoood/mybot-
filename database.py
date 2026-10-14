@@ -1,8 +1,8 @@
 """
-Работа с SQLite: пользователи + задачи + статистика.
+Работа с SQLite: пользователи + задачи + статистика + промокоды + лимиты.
 """
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 DB_PATH = "bot_data.db"
@@ -11,10 +11,14 @@ DB_PATH = "bot_data.db"
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            mode TEXT NOT NULL DEFAULT 'funny'
+            mode TEXT NOT NULL DEFAULT 'funny',
+            premium INTEGER NOT NULL DEFAULT 0,
+            premium_until TEXT,
+            last_active TEXT
         )
     """)
     cur.execute("""
@@ -24,6 +28,26 @@ def init_db() -> None:
             text TEXT NOT NULL,
             remind_at TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending'
+        )
+    """)
+    # Промокоды
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS promocodes (
+            code TEXT PRIMARY KEY,
+            days INTEGER NOT NULL DEFAULT 30,
+            used_by INTEGER,
+            used_at TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    # Ежедневные лимиты: user_id + date -> счётчики
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_limits (
+            user_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            chat_requests INTEGER NOT NULL DEFAULT 0,
+            reminders_created INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, date)
         )
     """)
     conn.commit()
@@ -52,7 +76,181 @@ def set_user_mode(user_id: int, mode: str) -> None:
     conn.close()
 
 
-# ---------- Задачи ----------
+# ---------- Премиум ----------
+
+def is_premium(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT premium, premium_until FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return False
+    premium, until = row
+    if not premium:
+        return False
+    if until and datetime.fromisoformat(until) < datetime.now():
+        # Срок истёк — снимаем
+        set_premium(user_id, False)
+        return False
+    return True
+
+
+def set_premium(user_id: int, active: bool, days: int = 30) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    until = (datetime.now() + timedelta(days=days)).isoformat() if active else None
+    cur.execute("""
+        INSERT INTO users (user_id, premium, premium_until) VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET premium = excluded.premium, premium_until = excluded.premium_until
+    """, (user_id, 1 if active else 0, until))
+    conn.commit()
+    conn.close()
+
+
+# ---------- Лимиты (бесплатный тариф) ----------
+
+FREE_CHAT_LIMIT = 10        # запросов к боту (обычные сообщения) в день
+FREE_REMINDER_LIMIT = 2     # напоминаний в день
+
+
+def get_today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def get_limits(user_id: int) -> dict:
+    """Возвращает {'chat_requests': N, 'reminders_created': N} за сегодня."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT chat_requests, reminders_created FROM user_limits WHERE user_id = ? AND date = ?",
+        (user_id, get_today_str())
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"chat_requests": 0, "reminders_created": 0}
+    return {"chat_requests": row[0], "reminders_created": row[1]}
+
+
+def increment_chat_requests(user_id: int) -> int:
+    """Увеличивает счётчик чат-запросов на 1. Возвращает новое значение."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    today = get_today_str()
+    cur.execute("""
+        INSERT INTO user_limits (user_id, date, chat_requests) VALUES (?, ?, 1)
+        ON CONFLICT(user_id, date) DO UPDATE SET chat_requests = chat_requests + 1
+    """, (user_id, today))
+    conn.commit()
+    cur.execute(
+        "SELECT chat_requests FROM user_limits WHERE user_id = ? AND date = ?",
+        (user_id, today)
+    )
+    val = cur.fetchone()[0]
+    conn.close()
+    return val
+
+
+def increment_reminders(user_id: int) -> int:
+    """Увеличивает счётчик созданных напоминаний на 1. Возвращает новое значение."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    today = get_today_str()
+    cur.execute("""
+        INSERT INTO user_limits (user_id, date, reminders_created) VALUES (?, ?, 1)
+        ON CONFLICT(user_id, date) DO UPDATE SET reminders_created = reminders_created + 1
+    """, (user_id, today))
+    conn.commit()
+    cur.execute(
+        "SELECT reminders_created FROM user_limits WHERE user_id = ? AND date = ?",
+        (user_id, today)
+    )
+    val = cur.fetchone()[0]
+    conn.close()
+    return val
+
+
+# ---------- Активность (для /botstat) ----------
+
+def update_last_active(user_id: int) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (user_id, last_active) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET last_active = excluded.last_active
+    """, (user_id, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def get_total_users() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    total = cur.fetchone()[0]
+    conn.close()
+    return total
+
+
+def get_active_users(hours: int) -> int:
+    """Сколько уникальных пользователей писали за последние N часов."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    threshold = (datetime.now() - timedelta(hours=hours)).isoformat()
+    cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (threshold,))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+
+# ---------- Промокоды ----------
+
+def create_promocode(code: str, days: int = 30) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO promocodes (code, days, created_at) VALUES (?, ?, ?)",
+        (code.upper(), days, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def redeem_promocode(user_id: int, code: str) -> tuple[bool, str]:
+    """
+    Проверяет и активирует промокод.
+    Возвращает (успех, сообщение).
+    """
+    code = code.upper().strip()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT days, used_by FROM promocodes WHERE code = ?", (code,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return False, "Такого промокода не существует."
+
+    days, used_by = row
+    if used_by is not None:
+        conn.close()
+        return False, "Этот промокод уже использован."
+
+    # Активируем
+    cur.execute(
+        "UPDATE promocodes SET used_by = ?, used_at = ? WHERE code = ?",
+        (user_id, datetime.now().isoformat(), code)
+    )
+    conn.commit()
+    conn.close()
+
+    # Даём Premium
+    set_premium(user_id, True, days)
+    return True, f"Промокод активирован! Premium на {days} дней."
+
+
+# ---------- Задачи (как было) ----------
 
 def add_task(user_id: int, text: str, remind_at: datetime) -> int:
     conn = sqlite3.connect(DB_PATH)
@@ -71,9 +269,7 @@ def get_pending_tasks(user_id: Optional[int] = None) -> list[dict]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     if user_id is None:
-        cur.execute(
-            "SELECT id, user_id, text, remind_at FROM tasks WHERE status = 'pending'"
-        )
+        cur.execute("SELECT id, user_id, text, remind_at FROM tasks WHERE status = 'pending'")
     else:
         cur.execute(
             "SELECT id, user_id, text, remind_at FROM tasks WHERE status = 'pending' AND user_id = ?",
@@ -90,33 +286,23 @@ def get_pending_tasks(user_id: Optional[int] = None) -> list[dict]:
 def get_task_by_id(task_id: int) -> Optional[dict]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute(
-        "SELECT id, user_id, text, remind_at, status FROM tasks WHERE id = ?",
-        (task_id,)
-    )
+    cur.execute("SELECT id, user_id, text, remind_at, status FROM tasks WHERE id = ?", (task_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
         return None
-    return {
-        "id": row[0], "user_id": row[1], "text": row[2],
-        "remind_at": row[3], "status": row[4]
-    }
+    return {"id": row[0], "user_id": row[1], "text": row[2], "remind_at": row[3], "status": row[4]}
 
 
 def update_task_remind_at(task_id: int, remind_at: datetime) -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute(
-        "UPDATE tasks SET remind_at = ? WHERE id = ?",
-        (remind_at.isoformat(), task_id)
-    )
+    cur.execute("UPDATE tasks SET remind_at = ? WHERE id = ?", (remind_at.isoformat(), task_id))
     conn.commit()
     conn.close()
 
 
 def mark_task_status(task_id: int, status: str) -> None:
-    """'done' / 'failed' / 'cancelled'."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
@@ -140,31 +326,9 @@ def cancel_all_user_tasks(user_id: int) -> int:
 # ---------- Статистика ----------
 
 def get_user_stats(user_id: int) -> dict:
-    """Возвращает {'done': N, 'failed': N, 'cancelled': N, 'pending': N}."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        SELECT status, COUNT(*) FROM tasks WHERE user_id = ? GROUP BY status
-    """, (user_id,))
-    rows = cur.fetchall()
-    conn.close()
-    stats = {"done": 0, "failed": 0, "cancelled": 0, "pending": 0}
-    for status, count in rows:
-        if status in stats:
-            stats[status] = count
-    return stats
-
-
-def get_user_stats_by_period(user_id: int, days: int = 7) -> dict:
-    """Статистика за последние N дней."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    threshold = (datetime.now() - __import__("datetime").timedelta(days=days)).isoformat()
-    cur.execute("""
-        SELECT status, COUNT(*) FROM tasks
-        WHERE user_id = ? AND remind_at >= ?
-        GROUP BY status
-    """, (user_id, threshold))
+    cur.execute("SELECT status, COUNT(*) FROM tasks WHERE user_id = ? GROUP BY status", (user_id,))
     rows = cur.fetchall()
     conn.close()
     stats = {"done": 0, "failed": 0, "cancelled": 0, "pending": 0}
