@@ -1,9 +1,9 @@
 """
-Бот-напоминалка с характером. Версия 19:
-- Фикс: allowed_updates для callback_query (кнопки Premium заработали)
-- /botstat теперь показывает Premium-пользователей
-- /paysupport — поддержка по оплате
-- Чистый чат + режимы в /settings
+Бот-напоминалка с характером. Версия 20:
+- Фикс: выход из режима промокода (отмена/кнопки меню)
+- Усиленная токсичность в токсичном режиме
+- /botstat с Premium-пользователями
+- Промокоды + оплата Stars
 """
 import os
 import re
@@ -52,7 +52,6 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://mybot-ba32.onren
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "my-super-secret-2026")
 
-# Telegram ID админов (число, без @ и букв)
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 PREMIUM_PRICE_STARS = 45
@@ -153,12 +152,17 @@ COMMON_RULES = (
 
 SYSTEM_PROMPTS = {
     "toxic": COMMON_RULES + (
-        "\nТвой характер: дерзкий, токсичный, но по-своему любящий кореш. Общаешься на 'ты', "
-        "по-пацански, коротко и хлёстко. Подкалываешь, но без реальных оскорблений и без мата. "
-        "Отвечай живо, 1-3 предложения, как в переписке с другом. "
-        "Не пиши как ассистент, не будь вежливым. Не пиши длинные абзацы. "
-        "Ты можешь быть резким, использовать сарказм и подколы. "
-        "Твоя цель — не оскорбить, а поддеть, чтобы человек улыбнулся."
+        "\nТвой характер: жёсткий, саркастичный, дерзкий кореш. Ты НЕ добрый. "
+        "Ты подкалываешь, язвишь, стебёшь, иногда откровенно троллишь. "
+        "Общаешься на 'ты', по-пацански, коротко и хлёстко. "
+        "Твои ответы — резкие, с сарказмом, иногда с лёгким презрением: "
+        "«серьёзно?», «ну ты и выдал», «я так и знал», «это всё, на что ты способен?». "
+        "Можешь использовать чёрный юмор (без мата и без реальных оскорблений личности). "
+        "Цель — поддеть, чтобы человек или улыбнулся, или взбесился и пошёл делать. "
+        "Отвечай 1-3 предложения, как в переписке с язвительным другом. "
+        "Не пиши как ассистент, не будь добреньким. Будь колючим. "
+        "ВАЖНО: НЕ называй собеседника «спортсмен» или «чемпион» — это звучит как заезженная пластинка. "
+        "Обращайся по-разному: «бро», «дружище», «слушай», «эй», или вообще без обращения."
     ),
     "funny": COMMON_RULES + (
         "\nТвой характер: весёлый, тёплый кореш с хорошим чувством юмора. Общаешься на 'ты', "
@@ -187,7 +191,7 @@ def ask_groq(user_id: int, user_message: str, mode: str, extra_context: str = ""
                 {"role": "system", "content": SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["funny"])},
                 *history,
             ],
-            temperature=0.9,
+            temperature=0.95,
             max_tokens=250,
         )
         answer = response.choices[0].message.content.strip()
@@ -255,9 +259,15 @@ def reaction_done(user_id: int, mode: str) -> str:
     failed = stats.get("failed", 0)
     total = done + failed
 
+    if mode == "toxic":
+        if total <= 2:
+            return "О, неужели. Сделал. Я прям удивлён, если честно. Не привыкай к похвале."
+        if done >= 5 and done > failed:
+            return f"Опа, {done} задач закрыто. Слушай, ты либо заболел, либо реально взялся за ум. Продолжай."
+        return "Сделал. Ну наконец-то. Следующая задача сама себя не сделает, если ты не в курсе."
+
     if total <= 2:
         base = {
-            "toxic": "О, неужели. Не ожидал. Держи пять, но не расслабляйся.",
             "funny": "Красава! Не забудь рассказать, как прошло 😎",
             "serious": "Отлично. Задача отмечена как выполненная.",
         }
@@ -265,14 +275,12 @@ def reaction_done(user_id: int, mode: str) -> str:
 
     if done >= 5 and done > failed:
         praise = {
-            "toxic": f"Опа, {done} задач закрыто. Я в шоке. Продолжай, может из тебя выйдет толк.",
             "funny": f"Слушай, {done} задач — это уже система! Горжусь тобой 😎",
             "serious": f"Отличный результат. {done} выполненных задач.",
         }
         return praise.get(mode, "Отлично!")
 
     base = {
-        "toxic": "Сделал. Ну наконец-то. Следующая задача сама себя не сделает.",
         "funny": "Красава! Что там у нас дальше? 😎",
         "serious": "Принято. Задача отмечена как выполненная.",
     }
@@ -284,9 +292,15 @@ def reaction_fail(user_id: int, mode: str) -> str:
     failed = stats.get("failed", 0)
     done = stats.get("done", 0)
 
+    if mode == "toxic":
+        if failed == 1:
+            return "Ну конечно. Классика жанра. «Я сегодня устал, завтра точно». Я это уже слышал."
+        if failed >= 5 and failed > done:
+            return f"Уже {failed} задач забито. Ты вообще собирался что-то делать или так, для галочки мне написал?"
+        return f"Забил. Уже {failed}-й раз, если я правильно считаю. Может, пора что-то менять в жизни?"
+
     if failed == 1:
         base = {
-            "toxic": "Ну конечно. Классика жанра. «Я сегодня устал, завтра точно».",
             "funny": "Ну классика. Записал как забил, больше не дёргаю 😄",
             "serious": "Понял. Задача отмечена как невыполненная.",
         }
@@ -294,14 +308,12 @@ def reaction_fail(user_id: int, mode: str) -> str:
 
     if failed >= 5 and failed > done:
         roast = {
-            "toxic": f"Уже {failed} задач забито. Ты вообще собирался что-то делать?",
             "funny": f"{failed} забитых задач 😅 Может тебе напоминания ставить, чтобы ты напоминания не забивал?",
             "serious": f"Это {failed}-я невыполненная задача. Рекомендую пересмотреть подход.",
         }
         return roast.get(mode, "Понял.")
 
     base = {
-        "toxic": f"Забил. Уже {failed}-й раз. Может, пора что-то менять?",
         "funny": f"Опять забил 😄 Ладно, не дёргаю. Но статистика растёт.",
         "serious": f"Понял. Всего невыполненных: {failed}.",
     }
@@ -474,7 +486,6 @@ async def cmd_premium(message: Message):
 
 @dp.message(Command("paysupport"))
 async def cmd_paysupport(message: Message):
-    """Обязательная команда по требованиям Telegram."""
     await message.answer(
         "💳 *Поддержка по оплате*\n\n"
         "Если у тебя возникли проблемы с оплатой Premium (звёзды списались, но доступ не пришёл) "
@@ -662,7 +673,8 @@ async def cb_enter_promo(callback: CallbackQuery):
     awaiting_promo.add(callback.from_user.id)
     await callback.message.answer(
         "🎁 *Введи промокод.*\n\n"
-        "Просто отправь его следующим сообщением. Например: `BRO2026`",
+        "Просто отправь его следующим сообщением. Например: `BRO2026`\n\n"
+        "Если передумал — напиши «отмена» 🤝",
         parse_mode="Markdown",
     )
     await callback.answer()
@@ -928,13 +940,42 @@ async def handle_message(message: Message):
     user_id = message.from_user.id
     update_last_active(user_id)
 
+    # Режим ввода промокода
     if user_id in awaiting_promo:
-        code = message.text.strip().upper()
+        text = message.text.strip()
+
+        # 1) Явный выход по ключевым словам
+        if text.lower() in ("отмена", "выход", "cancel", "назад", "стоп", "/cancel"):
+            awaiting_promo.discard(user_id)
+            await message.answer("Ок, выходим из режима промокода 🤝", reply_markup=chat_keyboard())
+            return
+
+        # 2) Если нажал кнопку меню — выходим из режима и обрабатываем кнопку
+        menu_buttons = {"⚙️ Настройки", "⬅️ В чат", "💎 Premium"} | set(MODE_BUTTONS.keys())
+        if text in menu_buttons:
+            awaiting_promo.discard(user_id)
+            if text == "⚙️ Настройки":
+                await cmd_settings(message)
+            elif text == "⬅️ В чат":
+                await message.answer("Ок, вернулся в обычный режим 🤝", reply_markup=chat_keyboard())
+            elif text == "💎 Premium":
+                await cmd_premium(message)
+            elif text in MODE_BUTTONS:
+                mode = MODE_BUTTONS[text]
+                set_user_mode(user_id, mode)
+                dialogue_memory[user_id].clear()
+                await message.answer(MODE_REPLIES[mode], reply_markup=settings_keyboard())
+            return
+
+        # 3) Проверяем как промокод
+        code = text.upper()
         if not re.match(r"^[A-Z0-9\-]{4,20}$", code):
             await message.answer(
-                "Хм, это не похоже на промокод. Попробуй ещё раз или жми /premium чтобы выйти."
+                "Хм, это не похоже на промокод.\n\n"
+                "Попробуй ещё раз или напиши «отмена», чтобы выйти."
             )
             return
+
         awaiting_promo.discard(user_id)
         success, msg = redeem_promocode(user_id, code)
         if success:
@@ -974,7 +1015,6 @@ async def on_startup(bot: Bot) -> None:
         url=webhook_url,
         secret_token=WEBHOOK_SECRET,
         drop_pending_updates=True,
-        # КРИТИЧНО: без callback_query inline-кнопки не работают
         allowed_updates=["message", "callback_query", "pre_checkout_query"],
     )
     logging.info("Webhook установлен: %s", webhook_url)
