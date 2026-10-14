@@ -1,11 +1,17 @@
 """
-Работа с SQLite: пользователи + задачи + статистика + промокоды + лимиты.
+Работа с SQLite: пользователи + задачи + статистика + промокоды + лимиты + рефералы.
 """
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
 
 DB_PATH = "bot_data.db"
+
+# Бонусы и скидки
+REF_BONUS_REFERRER = 5         # +5 запросов тому, кто привёл
+REF_BONUS_NEW = 3              # +3 запроса новому
+REF_DISCOUNT_THRESHOLD = 3     # с 3 друзей — скидка
+REF_DISCOUNT_PERCENT = 30      # 30%
 
 
 def init_db() -> None:
@@ -18,7 +24,11 @@ def init_db() -> None:
             mode TEXT NOT NULL DEFAULT 'funny',
             premium INTEGER NOT NULL DEFAULT 0,
             premium_until TEXT,
-            last_active TEXT
+            last_active TEXT,
+            bonus_requests INTEGER NOT NULL DEFAULT 0,
+            ref_count INTEGER NOT NULL DEFAULT 0,
+            referred_by INTEGER,
+            started_once INTEGER NOT NULL DEFAULT 0
         )
     """)
     cur.execute("""
@@ -34,9 +44,19 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS promocodes (
             code TEXT PRIMARY KEY,
             days INTEGER NOT NULL DEFAULT 30,
+            uses_left INTEGER NOT NULL DEFAULT 1,
+            total_uses INTEGER NOT NULL DEFAULT 1,
             used_by INTEGER,
             used_at TEXT,
             created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS promocode_redemptions (
+            code TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            redeemed_at TEXT NOT NULL,
+            PRIMARY KEY (code, user_id)
         )
     """)
     cur.execute("""
@@ -49,6 +69,22 @@ def init_db() -> None:
         )
     """)
     conn.commit()
+
+    # Миграция: добавляем колонки, если их нет (для существующих БД)
+    for col, table in [
+        ("bonus_requests", "users"),
+        ("ref_count", "users"),
+        ("referred_by", "users"),
+        ("started_once", "users"),
+        ("uses_left", "promocodes"),
+        ("total_uses", "promocodes"),
+    ]:
+        try:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} INTEGER DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
+
     conn.close()
 
 
@@ -105,7 +141,7 @@ def set_premium(user_id: int, active: bool, days: int = 30) -> None:
     conn.close()
 
 
-# ---------- Лимиты ----------
+# ---------- Лимиты и бонусы ----------
 
 FREE_CHAT_LIMIT = 10
 FREE_REMINDER_LIMIT = 2
@@ -123,10 +159,21 @@ def get_limits(user_id: int) -> dict:
         (user_id, get_today_str())
     )
     row = cur.fetchone()
+    cur.execute("SELECT bonus_requests FROM users WHERE user_id = ?", (user_id,))
+    bonus_row = cur.fetchone()
     conn.close()
-    if not row:
-        return {"chat_requests": 0, "reminders_created": 0}
-    return {"chat_requests": row[0], "reminders_created": row[1]}
+
+    used_chat = row[0] if row else 0
+    used_reminders = row[1] if row else 0
+    bonus = bonus_row[0] if bonus_row else 0
+
+    return {
+        "chat_requests": used_chat,
+        "reminders_created": used_reminders,
+        "bonus_requests": bonus,
+        "chat_limit": FREE_CHAT_LIMIT + bonus,
+        "reminder_limit": FREE_REMINDER_LIMIT,
+    }
 
 
 def increment_chat_requests(user_id: int) -> int:
@@ -159,18 +206,27 @@ def increment_reminders(user_id: int) -> int:
     return val
 
 
+def add_bonus_requests(user_id: int, amount: int) -> None:
+    """Начисляет бонусные запросы (складываются с дневным лимитом)."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (user_id, bonus_requests) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET bonus_requests = bonus_requests + ?
+    """, (user_id, amount, amount))
+    conn.commit()
+    conn.close()
+
+
 # ---------- Активность ----------
 
 def update_last_active(user_id: int) -> None:
-    """Обновляет last_active. Если юзера нет — создаёт его."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # Пытаемся обновить
     cur.execute(
         "UPDATE users SET last_active = ? WHERE user_id = ?",
         (datetime.now().isoformat(), user_id)
     )
-    # Если записи не было — создаём
     if cur.rowcount == 0:
         cur.execute("""
             INSERT INTO users (user_id, mode, premium, last_active)
@@ -200,7 +256,6 @@ def get_active_users(hours: int) -> int:
 
 
 def get_premium_users() -> int:
-    """Сколько пользователей с активным Premium."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     now = datetime.now().isoformat()
@@ -213,14 +268,97 @@ def get_premium_users() -> int:
     return count
 
 
+# ---------- Рефералы ----------
+
+def is_new_user(user_id: int) -> bool:
+    """True, если пользователь ещё ни разу не писал боту."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT started_once FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return not row or not row[0]
+
+
+def mark_user_started(user_id: int) -> None:
+    """Помечаем, что юзер уже активировался (писал боту)."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (user_id, started_once) VALUES (?, 1)
+        ON CONFLICT(user_id) DO UPDATE SET started_once = 1
+    """, (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def register_referral(new_user_id: int, referrer_id: int) -> tuple[bool, str]:
+    """
+    Обрабатывает реферала. Возвращает (успех, сообщение для реферера).
+    Засчитывается ТОЛЬКО если новый юзер реально новый и referrer не он сам.
+    """
+    if new_user_id == referrer_id:
+        return False, "Нельзя пригласить самого себя."
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # Проверяем, что приглашённый ещё не в базе как активный
+    cur.execute("SELECT started_once, referred_by FROM users WHERE user_id = ?", (new_user_id,))
+    row = cur.fetchone()
+
+    if row and row[0]:  # уже был в боте
+        conn.close()
+        return False, "Этот пользователь уже пользуется ботом."
+
+    if row and row[1]:  # уже был привязан к кому-то
+        conn.close()
+        return False, "Этот пользователь уже был приглашён."
+
+    # Записываем связь
+    cur.execute("""
+        INSERT INTO users (user_id, referred_by, started_once) VALUES (?, ?, 0)
+        ON CONFLICT(user_id) DO UPDATE SET referred_by = excluded.referred_by
+    """, (new_user_id, referrer_id))
+
+    # Начисляем бонус рефереру
+    cur.execute("""
+        INSERT INTO users (user_id, bonus_requests, ref_count) VALUES (?, ?, 1)
+        ON CONFLICT(user_id) DO UPDATE SET
+            bonus_requests = bonus_requests + ?,
+            ref_count = ref_count + 1
+    """, (referrer_id, REF_BONUS_REFERRER, REF_BONUS_REFERRER))
+
+    conn.commit()
+    conn.close()
+    return True, f"+{REF_BONUS_REFERRER} бонусных запросов"
+
+
+def get_referral_stats(user_id: int) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT ref_count, bonus_requests FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"ref_count": 0, "bonus_requests": 0}
+    return {"ref_count": row[0] or 0, "bonus_requests": row[1] or 0}
+
+
+def has_referral_discount(user_id: int) -> bool:
+    """True, если у юзера 3+ друзей → скидка на Premium."""
+    stats = get_referral_stats(user_id)
+    return stats["ref_count"] >= REF_DISCOUNT_THRESHOLD
+
+
 # ---------- Промокоды ----------
 
-def create_promocode(code: str, days: int = 30) -> None:
+def create_promocode(code: str, days: int = 30, uses: int = 1) -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO promocodes (code, days, created_at) VALUES (?, ?, ?)",
-        (code.upper(), days, datetime.now().isoformat())
+        "INSERT INTO promocodes (code, days, uses_left, total_uses, created_at) VALUES (?, ?, ?, ?, ?)",
+        (code.upper(), days, uses, uses, datetime.now().isoformat())
     )
     conn.commit()
     conn.close()
@@ -230,21 +368,29 @@ def redeem_promocode(user_id: int, code: str) -> tuple[bool, str]:
     code = code.upper().strip()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT days, used_by FROM promocodes WHERE code = ?", (code,))
+    cur.execute("SELECT days, uses_left FROM promocodes WHERE code = ?", (code,))
     row = cur.fetchone()
 
     if not row:
         conn.close()
         return False, "Такого промокода не существует."
 
-    days, used_by = row
-    if used_by is not None:
+    days, uses_left = row
+    if uses_left <= 0:
         conn.close()
-        return False, "Этот промокод уже использован."
+        return False, "Этот промокод уже исчерпан."
 
+    # Проверяем, не активировал ли уже этот юзер код
+    cur.execute("SELECT 1 FROM promocode_redemptions WHERE code = ? AND user_id = ?", (code, user_id))
+    if cur.fetchone():
+        conn.close()
+        return False, "Ты уже использовал этот промокод."
+
+    # Списываем использование
+    cur.execute("UPDATE promocodes SET uses_left = uses_left - 1 WHERE code = ?", (code,))
     cur.execute(
-        "UPDATE promocodes SET used_by = ?, used_at = ? WHERE code = ?",
-        (user_id, datetime.now().isoformat(), code)
+        "INSERT INTO promocode_redemptions (code, user_id, redeemed_at) VALUES (?, ?, ?)",
+        (code, user_id, datetime.now().isoformat())
     )
     conn.commit()
     conn.close()
