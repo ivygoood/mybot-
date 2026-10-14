@@ -1,10 +1,12 @@
 """
-Бот-напоминалка с характером. Версия 17:
+Бот-напоминалка с характером. Версия 18:
 - /botstat — статистика для админа
 - /createpromo — создание промокодов для админа
+- /paysupport — поддержка по оплате (требование Telegram)
 - Промокоды через меню
 - Подписка за Telegram Stars (45 звёзд)
 - Лимиты: 10 чатов + 2 напоминания в день (Premium — безлимит)
+- Чистый чат без кнопок режимов, режимы — в /settings
 """
 import os
 import re
@@ -53,7 +55,7 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://mybot-ba32.onren
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "my-super-secret-2026")
 
-# Telegram ID админов (тебе выдаст @userinfobot)
+# Telegram ID админов (число, без @ и букв)
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 # Цена подписки в звёздах
@@ -79,7 +81,6 @@ MAX_HISTORY = 20
 
 recent_reminders: dict[int, dict] = {}
 pending_cancel: dict[int, list[dict]] = {}
-# Ожидание ввода промокода
 awaiting_promo: set[int] = set()
 
 
@@ -91,14 +92,26 @@ MODE_BUTTONS = {
 }
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
-    """Основная клавиатура с режимами + Premium."""
+def chat_keyboard() -> ReplyKeyboardMarkup:
+    """Чистая клавиатура для обычного чата — только кнопка настроек."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⚙️ Настройки")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def settings_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура внутри настроек — режимы + Premium + возврат."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="😈 Токсичный")],
             [KeyboardButton(text="🤪 Угарный")],
             [KeyboardButton(text="🧐 Серьёзный")],
             [KeyboardButton(text="💎 Premium")],
+            [KeyboardButton(text="⬅️ В чат")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -338,8 +351,6 @@ STATS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-PROMO_INPUT_PATTERN = re.compile(r"^[A-Z0-9]{4,20}$", re.IGNORECASE)
-
 
 def parse_simple_time(amount: int, unit: str) -> tuple[datetime, str]:
     unit = unit.lower()
@@ -392,8 +403,8 @@ async def cmd_start(message: Message):
         "• 💬 *Болтать* — просто напиши мне\n\n"
         f"Текущий режим: *{current}*\n"
         f"Тариф: *{badge}*\n\n"
-        "Выбирай стиль кнопками снизу или жми /help.",
-        reply_markup=main_keyboard(),
+        "Загляни в /settings, чтобы сменить стиль общения. Или просто пиши 🤝",
+        reply_markup=chat_keyboard(),
         parse_mode="Markdown",
     )
 
@@ -410,8 +421,9 @@ async def cmd_help(message: Message):
         "🗑 *Отмена* — «отмени напоминание»\n\n"
         "📊 *Статистика* — «статистика»\n\n"
         "💬 *Живое общение* — просто пиши как другу\n\n"
-        "💎 *Premium* — /premium\n\n"
-        "🎭 *Режимы:* 😈 Токсичный / 🤪 Угарный / 🧐 Серьёзный",
+        "⚙️ *Режимы и Premium* — /settings\n\n"
+        "💎 *Подписка* — /premium\n\n"
+        "💳 *Проблема с оплатой* — /paysupport",
         parse_mode="Markdown",
     )
 
@@ -435,7 +447,9 @@ async def cmd_settings(message: Message):
     await message.answer(
         f"⚙️ *Настройки*\n\n"
         f"🎭 Режим: *{current}*\n\n"
-        f"{limit_line}",
+        f"{limit_line}\n\n"
+        f"Выбери режим кнопками снизу.",
+        reply_markup=settings_keyboard(),
         parse_mode="Markdown",
     )
 
@@ -461,6 +475,19 @@ async def cmd_premium(message: Message):
         "• 🚀 Поддержка проекта\n\n"
         "Выбирай:",
         reply_markup=premium_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("paysupport"))
+async def cmd_paysupport(message: Message):
+    """Обязательная команда по требованиям Telegram для продажи цифровых товаров."""
+    await message.answer(
+        "💳 *Поддержка по оплате*\n\n"
+        "Если у тебя возникли проблемы с оплатой Premium (звёзды списались, но доступ не пришёл) "
+        "или хочешь оформить возврат — напиши нам:\n\n"
+        "📩 Контакт: [здесь вставь свой @username или email]\n\n"
+        "Мы разберёмся и всё поправим 🤝",
         parse_mode="Markdown",
     )
 
@@ -566,7 +593,7 @@ async def on_stats(message: Message):
     )
 
 
-# ---- Кнопки режимов ----
+# ---- Кнопки режимов (только в настройках) ----
 @dp.message(F.text.in_(MODE_BUTTONS.keys()))
 async def on_mode_button(message: Message):
     update_last_active(message.from_user.id)
@@ -575,10 +602,23 @@ async def on_mode_button(message: Message):
     dialogue_memory[message.from_user.id].clear()
     recent_reminders.pop(message.from_user.id, None)
     pending_cancel.pop(message.from_user.id, None)
-    await message.answer(MODE_REPLIES[mode], reply_markup=main_keyboard())
+    await message.answer(MODE_REPLIES[mode], reply_markup=settings_keyboard())
 
 
-# ---- Кнопка Premium ----
+# ---- Кнопки меню ----
+@dp.message(F.text == "⚙️ Настройки")
+async def on_settings_button(message: Message):
+    await cmd_settings(message)
+
+
+@dp.message(F.text == "⬅️ В чат")
+async def on_back_to_chat(message: Message):
+    await message.answer(
+        "Ок, вернулся в обычный режим. Просто пиши мне что угодно 🤝",
+        reply_markup=chat_keyboard(),
+    )
+
+
 @dp.message(F.text == "💎 Premium")
 async def on_premium_button(message: Message):
     update_last_active(message.from_user.id)
@@ -606,16 +646,22 @@ async def cb_buy_premium(callback: CallbackQuery):
         await callback.answer()
         return
 
-    # Создаём счёт на оплату звёздами
-    await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title="Мой Кореш Premium",
-        description=f"Безлимит запросов и напоминаний на {PREMIUM_DAYS} дней",
-        payload=f"premium_{callback.from_user.id}_{PREMIUM_DAYS}",
-        provider_token="",  # для звёзд пустой
-        currency="XTR",     # XTR — код Telegram Stars
-        prices=[LabeledPrice(label="Premium", amount=PREMIUM_PRICE_STARS)],
-    )
+    # Создаём счёт на оплату звёздами (XTR + пустой provider_token)
+    try:
+        await bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title="Мой Кореш Premium",
+            description=f"Безлимит запросов и напоминаний на {PREMIUM_DAYS} дней",
+            payload=f"premium_{callback.from_user.id}_{PREMIUM_DAYS}",
+            provider_token="",   # для звёзд пустой
+            currency="XTR",      # XTR — код Telegram Stars
+            prices=[LabeledPrice(label="Premium", amount=PREMIUM_PRICE_STARS)],
+        )
+    except Exception as e:
+        logging.error("Ошибка send_invoice: %s", e)
+        await callback.message.answer(
+            "❌ Не удалось создать счёт. Возможно, Telegram Stars недоступны для твоего аккаунта."
+        )
     await callback.answer()
 
 
@@ -633,13 +679,11 @@ async def cb_enter_promo(callback: CallbackQuery):
 # ---- Обработка оплаты Stars ----
 @dp.pre_checkout_query()
 async def on_pre_checkout(pre_checkout_q: PreCheckoutQuery):
-    """Подтверждаем платёж — обязательный шаг."""
     await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
 
 
 @dp.message(F.successful_payment)
 async def on_successful_payment(message: Message):
-    """Платёж прошёл — выдаём Premium."""
     user_id = message.from_user.id
     set_premium(user_id, True, PREMIUM_DAYS)
     await message.answer(
@@ -698,7 +742,6 @@ async def on_cancel_number(message: Message):
     update_last_active(message.from_user.id)
     user_id = message.from_user.id
     if user_id not in pending_cancel:
-        # Может быть промокод из цифр? Маловероятно, идём в чат
         await route_to_chat(message)
         return
 
@@ -723,7 +766,6 @@ async def on_cancel_number(message: Message):
 
 # ---- Напоминания ----
 def check_reminder_limit(user_id: int) -> bool:
-    """True если можно создавать, False если лимит."""
     if is_premium(user_id):
         return True
     limits = get_limits(user_id)
@@ -842,9 +884,8 @@ async def send_reminder(user_id: int, task_id: int, task_text: str, mode: str):
         logging.warning("Не смог отправить напоминание: %s", e)
 
 
-# ---- Основной чат (с проверкой лимитов и промокодов) ----
+# ---- Основной чат (с лимитами и промокодами) ----
 async def route_to_chat(message: Message):
-    """Отправляет сообщение в LLM с учётом лимита."""
     user_id = message.from_user.id
     mode = get_user_mode(user_id)
     normalized = normalize_answer(message.text)
@@ -871,7 +912,6 @@ async def route_to_chat(message: Message):
 
         del recent_reminders[user_id]
         context = f"Только что было напоминание по задаче: «{task_text}». Пользователь отвечает нестандартно."
-        # Запрос к LLM = расход лимита
         if not is_premium(user_id):
             current = increment_chat_requests(user_id)
             if current > FREE_CHAT_LIMIT:
@@ -881,7 +921,6 @@ async def route_to_chat(message: Message):
         await message.answer(answer)
         return
 
-    # Обычный чат — проверяем лимит
     if not is_premium(user_id):
         current = increment_chat_requests(user_id)
         if current > FREE_CHAT_LIMIT:
@@ -897,10 +936,8 @@ async def handle_message(message: Message):
     user_id = message.from_user.id
     update_last_active(user_id)
 
-    # 1. Если пользователь вводит промокод
     if user_id in awaiting_promo:
         code = message.text.strip().upper()
-        # Простейшая валидация формата
         if not re.match(r"^[A-Z0-9\-]{4,20}$", code):
             await message.answer(
                 "Хм, это не похоже на промокод. Попробуй ещё раз или жми /premium чтобы выйти."
@@ -914,7 +951,6 @@ async def handle_message(message: Message):
             await message.answer(f"❌ {msg}")
         return
 
-    # 2. Всё остальное — в основной чат
     await route_to_chat(message)
 
 
