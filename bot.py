@@ -1,9 +1,9 @@
 """
-Бот-напоминалка с характером. Версия 21:
+Бот-напоминалка с характером. Версия 22:
+- Фикс: реферальная ссылка "Поделиться" без %20
 - Промокоды с количеством активаций
 - Реферальная система (+5 запросов за друга, +3 новому)
 - Скидка 30% на Premium при 3+ друзьях
-- /invite со статистикой и мотивацией
 """
 import os
 import re
@@ -11,6 +11,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from collections import defaultdict
+from urllib.parse import quote
 
 import dateparser
 from aiohttp import web
@@ -86,7 +87,6 @@ recent_reminders: dict[int, dict] = {}
 pending_cancel: dict[int, list[dict]] = {}
 awaiting_promo: set[int] = set()
 
-# Ожидающие рефералы: user_id -> referrer_id (ждём первое сообщение)
 pending_referrals: dict[int, int] = {}
 
 
@@ -138,9 +138,15 @@ def premium_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def invite_share_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Кнопка 'Поделиться' с корректно закодированной ссылкой."""
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
     share_text = "Попробуй бота-кореша — напоминает, троллит, общается 🤝"
-    share_url = f"https://t.me/share/url?url={ref_link}&text={share_text}"
+    # Кодируем URL и текст, чтобы не было %20 и кракозябр
+    share_url = (
+        f"https://t.me/share/url"
+        f"?url={quote(ref_link, safe='')}"
+        f"&text={quote(share_text, safe='')}"
+    )
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)],
     ])
@@ -401,7 +407,6 @@ def is_admin(user_id: int) -> bool:
 
 
 def actual_premium_price(user_id: int) -> int:
-    """Возвращает цену Premium в звёздах с учётом скидки по рефералам."""
     return PREMIUM_PRICE_DISCOUNTED if has_referral_discount(user_id) else PREMIUM_PRICE_STARS
 
 
@@ -412,7 +417,7 @@ async def cmd_start(message: Message, command: CommandObject):
     user_id = message.from_user.id
     update_last_active(user_id)
 
-    # Обработка реферальной ссылки (/start ref_123456789)
+    # Обработка реферальной ссылки
     ref_arg = command.args if command.args else None
     if ref_arg and ref_arg.startswith("ref_"):
         try:
@@ -421,9 +426,7 @@ async def cmd_start(message: Message, command: CommandObject):
             referrer_id = None
 
         if referrer_id and is_new_user(user_id) and referrer_id != user_id:
-            # Связь запомнили, ждём первого сообщения для начисления
             pending_referrals[user_id] = referrer_id
-            # Даём новому бонус сразу
             add_bonus_requests(user_id, REF_BONUS_NEW)
             await message.answer(
                 f"🎉 *Ты зашёл по приглашению друга!*\n\n"
@@ -519,7 +522,6 @@ async def cmd_premium(message: Message):
         )
         return
 
-    # Проверяем скидку
     has_discount = has_referral_discount(message.from_user.id)
     stats = get_referral_stats(message.from_user.id)
     price = actual_premium_price(message.from_user.id)
@@ -567,7 +569,6 @@ async def cmd_invite(message: Message):
 
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
 
-    # Мотивационный блок
     if ref_count >= REF_DISCOUNT_THRESHOLD:
         motivation = (
             f"🎉 *У тебя уже скидка {REF_DISCOUNT_PERCENT}% на Premium!*\n"
@@ -619,7 +620,6 @@ async def cmd_botstat(message: Message):
 
 @dp.message(Command("createpromo"))
 async def cmd_createpromo(message: Message):
-    """Использование: /createpromo CODE [дни] [активаций]"""
     if not is_admin(message.from_user.id):
         await message.answer("Эта команда только для админа 🤷")
         return
@@ -1067,7 +1067,6 @@ async def route_to_chat(message: Message):
 async def handle_message(message: Message):
     user_id = message.from_user.id
 
-    # Если это первое сообщение юзера и он пришёл по реф-ссылке — начисляем рефереру
     if user_id in pending_referrals:
         referrer_id = pending_referrals.pop(user_id)
         success, msg = register_referral(user_id, referrer_id)
@@ -1085,7 +1084,6 @@ async def handle_message(message: Message):
     update_last_active(user_id)
     mark_user_started(user_id)
 
-    # Режим ввода промокода
     if user_id in awaiting_promo:
         text = message.text.strip()
 
