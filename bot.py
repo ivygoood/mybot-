@@ -1,9 +1,9 @@
 """
-Бот-напоминалка с характером. Версия 20:
-- Фикс: выход из режима промокода (отмена/кнопки меню)
-- Усиленная токсичность в токсичном режиме
-- /botstat с Premium-пользователями
-- Промокоды + оплата Stars
+Бот-напоминалка с характером. Версия 21:
+- Промокоды с количеством активаций
+- Реферальная система (+5 запросов за друга, +3 новому)
+- Скидка 30% на Premium при 3+ друзьях
+- /invite со статистикой и мотивацией
 """
 import os
 import re
@@ -16,7 +16,7 @@ import dateparser
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
@@ -39,9 +39,14 @@ from database import (
     get_user_stats,
     is_premium, set_premium,
     get_limits, increment_chat_requests, increment_reminders,
+    add_bonus_requests,
     FREE_CHAT_LIMIT, FREE_REMINDER_LIMIT,
     update_last_active, get_total_users, get_active_users, get_premium_users,
     create_promocode, redeem_promocode,
+    is_new_user, mark_user_started, register_referral,
+    get_referral_stats, has_referral_discount,
+    REF_BONUS_REFERRER, REF_BONUS_NEW,
+    REF_DISCOUNT_THRESHOLD, REF_DISCOUNT_PERCENT,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -52,10 +57,13 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://mybot-ba32.onren
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "my-super-secret-2026")
 
+BOT_USERNAME = os.getenv("BOT_USERNAME", "moy_koresh_bot")
+
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 PREMIUM_PRICE_STARS = 45
 PREMIUM_DAYS = 30
+PREMIUM_PRICE_DISCOUNTED = int(PREMIUM_PRICE_STARS * (100 - REF_DISCOUNT_PERCENT) / 100)
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
@@ -77,6 +85,9 @@ MAX_HISTORY = 20
 recent_reminders: dict[int, dict] = {}
 pending_cancel: dict[int, list[dict]] = {}
 awaiting_promo: set[int] = set()
+
+# Ожидающие рефералы: user_id -> referrer_id (ждём первое сообщение)
+pending_referrals: dict[int, int] = {}
 
 
 # ---------- Клавиатуры ----------
@@ -126,6 +137,15 @@ def premium_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def invite_share_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    share_text = "Попробуй бота-кореша — напоминает, троллит, общается 🤝"
+    share_url = f"https://t.me/share/url?url={ref_link}&text={share_text}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)],
+    ])
+
+
 # ---------- Правила для LLM ----------
 COMMON_RULES = (
     "ВАЖНО О ТЕБЕ:\n"
@@ -136,6 +156,8 @@ COMMON_RULES = (
     "• Если спрашивают про подписку, тарифы, лимиты — говори про Premium: "
     "«Есть бесплатный тариф: 10 запросов и 2 напоминания в день. "
     "Premium — 45 звёзд в месяц, всё без лимитов». Никогда не выдумывай другие цены.\n"
+    "• Если пользователь упомянул, что упёрся в лимит или ему мало запросов — "
+    "в стиле текущего режима напомни про Premium. Не навязчиво, а как совет.\n"
     "• НЕ выдумывай числа, статистику, факты — если не знаешь точно, скажи «не знаю».\n"
     "• Про бессмысленные напоминания (типа «напомни чихнуть через 5 секунд») — "
     "отвечай с юмором: «Не в моих силах отложить такое, ты сам решай».\n"
@@ -219,18 +241,6 @@ CONFIRM_TEXTS = {
     "funny": "Записал. Напомню {when}. Готовься.",
     "serious": "Напоминание установлено. Сработает {when}.",
 }
-
-LIMIT_CHAT_TEXT = (
-    "🛑 *Лимит бесплатных запросов исчерпан.*\n\n"
-    f"Бесплатно: {FREE_CHAT_LIMIT} запросов в день.\n"
-    "Оформи Premium, чтобы общаться без лимитов ⤵"
-)
-
-LIMIT_REMINDER_TEXT = (
-    "🛑 *Лимит бесплатных напоминаний исчерпан.*\n\n"
-    f"Бесплатно: {FREE_REMINDER_LIMIT} напоминания в день.\n"
-    "Оформи Premium, чтобы ставить сколько нужно ⤵"
-)
 
 DONE_WORDS = {
     "сделал", "сделала", "сделано", "готово", "выполнил", "выполнено",
@@ -390,14 +400,48 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def actual_premium_price(user_id: int) -> int:
+    """Возвращает цену Premium в звёздах с учётом скидки по рефералам."""
+    return PREMIUM_PRICE_DISCOUNTED if has_referral_discount(user_id) else PREMIUM_PRICE_STARS
+
+
 # ---------- Хендлеры ----------
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
-    update_last_active(message.from_user.id)
-    current = get_user_mode(message.from_user.id)
-    premium = is_premium(message.from_user.id)
+async def cmd_start(message: Message, command: CommandObject):
+    user_id = message.from_user.id
+    update_last_active(user_id)
+
+    # Обработка реферальной ссылки (/start ref_123456789)
+    ref_arg = command.args if command.args else None
+    if ref_arg and ref_arg.startswith("ref_"):
+        try:
+            referrer_id = int(ref_arg[4:])
+        except ValueError:
+            referrer_id = None
+
+        if referrer_id and is_new_user(user_id) and referrer_id != user_id:
+            # Связь запомнили, ждём первого сообщения для начисления
+            pending_referrals[user_id] = referrer_id
+            # Даём новому бонус сразу
+            add_bonus_requests(user_id, REF_BONUS_NEW)
+            await message.answer(
+                f"🎉 *Ты зашёл по приглашению друга!*\n\n"
+                f"Тебе начислено *+{REF_BONUS_NEW} бонусных запросов* к дневному лимиту.\n"
+                f"Напиши что угодно, чтобы начать 🤝",
+                parse_mode="Markdown",
+            )
+
+    current = get_user_mode(user_id)
+    premium = is_premium(user_id)
     badge = "💎 Premium" if premium else "🆓 Бесплатный"
+    limits = get_limits(user_id)
+
+    if premium:
+        limit_line = "💎 Premium — безлимит"
+    else:
+        limit_line = f"🆓 Лимит: {limits['chat_requests']}/{limits['chat_limit']} запросов, " \
+                     f"{limits['reminders_created']}/{limits['reminder_limit']} напоминаний"
 
     await message.answer(
         "👋 *Здорово, бро! Я твой кореш.*\n\n"
@@ -405,10 +449,11 @@ async def cmd_start(message: Message):
         "• ⏰ *Напоминать* — «напомни через 30 минут позвонить маме»\n"
         "• 🗑 *Отменять* — «отмени напоминание»\n"
         "• 📊 *Считать статистику* — «статистика»\n"
-        "• 💬 *Болтать* — просто напиши мне\n\n"
-        f"Текущий режим: *{current}*\n"
-        f"Тариф: *{badge}*\n\n"
-        "Загляни в /settings, чтобы сменить стиль общения. Или просто пиши 🤝",
+        "• 💬 *Болтать* — просто напиши мне\n"
+        "• 🎁 *Приглашать друзей* — /invite\n\n"
+        f"Режим: *{current}*\n"
+        f"{limit_line}\n\n"
+        "Загляни в /settings, чтобы сменить стиль общения 🤝",
         reply_markup=chat_keyboard(),
         parse_mode="Markdown",
     )
@@ -425,6 +470,7 @@ async def cmd_help(message: Message):
         "• «напомни завтра в 7 утра сделать зарядку»\n\n"
         "🗑 *Отмена* — «отмени напоминание»\n\n"
         "📊 *Статистика* — «статистика»\n\n"
+        "🎁 *Пригласить друга* — /invite\n\n"
         "💬 *Живое общение* — просто пиши как другу\n\n"
         "⚙️ *Режимы и Premium* — /settings\n\n"
         "💎 *Подписка* — /premium\n\n"
@@ -445,9 +491,11 @@ async def cmd_settings(message: Message):
     else:
         limit_line = (
             f"🆓 Бесплатный тариф:\n"
-            f"• Запросы: *{limits['chat_requests']}/{FREE_CHAT_LIMIT}*\n"
-            f"• Напоминания: *{limits['reminders_created']}/{FREE_REMINDER_LIMIT}*"
+            f"• Запросы: *{limits['chat_requests']}/{limits['chat_limit']}*\n"
+            f"• Напоминания: *{limits['reminders_created']}/{limits['reminder_limit']}*"
         )
+        if limits["bonus_requests"] > 0:
+            limit_line += f"\n🎁 Бонусных запросов: *+{limits['bonus_requests']}*"
 
     await message.answer(
         f"⚙️ *Настройки*\n\n"
@@ -471,15 +519,28 @@ async def cmd_premium(message: Message):
         )
         return
 
+    # Проверяем скидку
+    has_discount = has_referral_discount(message.from_user.id)
+    stats = get_referral_stats(message.from_user.id)
+    price = actual_premium_price(message.from_user.id)
+
+    price_line = f"Цена: *{price} звёзд* в месяц."
+    if has_discount:
+        price_line += f"\n🎉 У тебя скидка *{REF_DISCOUNT_PERCENT}%* за {stats['ref_count']} приглашённых друзей!"
+
     await message.answer(
-        "💎 *Premium*\n\n"
-        f"Цена: *{PREMIUM_PRICE_STARS} звёзд* в месяц.\n\n"
+        f"💎 *Premium*\n\n"
+        f"{price_line}\n\n"
         "Что даёт:\n"
         "• ♾ Безлимит запросов к боту\n"
         "• ♾ Безлимит напоминаний\n"
         "• 🚀 Поддержка проекта\n\n"
         "Выбирай:",
-        reply_markup=premium_menu_keyboard(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⭐ Купить Premium ({price} звёзд)", callback_data="buy_premium")],
+            [InlineKeyboardButton(text="🎁 Ввести промокод", callback_data="enter_promo")],
+            [InlineKeyboardButton(text="ℹ️ Что даёт Premium", callback_data="premium_info")],
+        ]),
         parse_mode="Markdown",
     )
 
@@ -492,6 +553,45 @@ async def cmd_paysupport(message: Message):
         "или хочешь оформить возврат — напиши нам:\n\n"
         "📩 Контакт: [здесь вставь свой @username или email]\n\n"
         "Мы разберёмся и всё поправим 🤝",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("invite"))
+async def cmd_invite(message: Message):
+    update_last_active(message.from_user.id)
+    user_id = message.from_user.id
+    stats = get_referral_stats(user_id)
+    ref_count = stats["ref_count"]
+    bonuses = stats["bonus_requests"]
+
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+
+    # Мотивационный блок
+    if ref_count >= REF_DISCOUNT_THRESHOLD:
+        motivation = (
+            f"🎉 *У тебя уже скидка {REF_DISCOUNT_PERCENT}% на Premium!*\n"
+            f"Продолжай приглашать — и получишь ещё больше бонусов."
+        )
+    else:
+        left = REF_DISCOUNT_THRESHOLD - ref_count
+        motivation = (
+            f"🔥 *Приведи ещё {left} друга — и получишь скидку {REF_DISCOUNT_PERCENT}% на Premium!*\n"
+            f"Приводи друзей, получай бонусы и скидку."
+        )
+
+    await message.answer(
+        f"🎁 *Приглашай друзей и получай бонусы!*\n\n"
+        f"Твоя ссылка:\n`{ref_link}`\n\n"
+        f"📊 *Твоя статистика:*\n"
+        f"• Приглашено друзей: *{ref_count}*\n"
+        f"• Бонусных запросов накоплено: *+{bonuses}*\n\n"
+        f"💡 *Как это работает:*\n"
+        f"• За каждого друга — *+{REF_BONUS_REFERRER} запросов* тебе\n"
+        f"• Друг тоже получает *+{REF_BONUS_NEW} запроса* при входе\n"
+        f"• Друг должен написать боту хоть одно сообщение\n\n"
+        f"{motivation}",
+        reply_markup=invite_share_keyboard(user_id),
         parse_mode="Markdown",
     )
 
@@ -519,6 +619,7 @@ async def cmd_botstat(message: Message):
 
 @dp.message(Command("createpromo"))
 async def cmd_createpromo(message: Message):
+    """Использование: /createpromo CODE [дни] [активаций]"""
     if not is_admin(message.from_user.id):
         await message.answer("Эта команда только для админа 🤷")
         return
@@ -527,21 +628,25 @@ async def cmd_createpromo(message: Message):
     if len(parts) < 2:
         await message.answer(
             "Использование:\n"
-            "`/createpromo КОД [дни]`\n\n"
-            "Пример: `/createpromo BRO2026 30`",
+            "`/createpromo КОД [дни] [активаций]`\n\n"
+            "Примеры:\n"
+            "• `/createpromo BRO2026 30 1` — 30 дней, 1 активация\n"
+            "• `/createpromo FRIENDS 30 10` — 30 дней, 10 активаций",
             parse_mode="Markdown",
         )
         return
 
     code = parts[1].upper().strip()
     days = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
+    uses = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
 
     try:
-        create_promocode(code, days)
+        create_promocode(code, days, uses)
         await message.answer(
             f"✅ Промокод создан:\n\n"
             f"• Код: `{code}`\n"
-            f"• Дней Premium: *{days}*",
+            f"• Дней Premium: *{days}*\n"
+            f"• Активаций: *{uses}*",
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -637,7 +742,8 @@ async def cb_premium_info(callback: CallbackQuery):
         "• ♾ Безлимит запросов к боту\n"
         "• ♾ Безлимит напоминаний\n"
         "• 🚀 Поддержка проекта\n\n"
-        f"Цена: *{PREMIUM_PRICE_STARS} звёзд* в месяц.",
+        f"Цена: *{PREMIUM_PRICE_STARS} звёзд* в месяц "
+        f"(или *{PREMIUM_PRICE_DISCOUNTED}* со скидкой {REF_DISCOUNT_PERCENT}% за 3+ друзей).",
         parse_mode="Markdown",
     )
     await callback.answer()
@@ -645,20 +751,23 @@ async def cb_premium_info(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "buy_premium")
 async def cb_buy_premium(callback: CallbackQuery):
-    if is_premium(callback.from_user.id):
+    user_id = callback.from_user.id
+    if is_premium(user_id):
         await callback.message.answer("💎 У тебя уже активен Premium.")
         await callback.answer()
         return
 
+    price = actual_premium_price(user_id)
+
     try:
         await bot.send_invoice(
-            chat_id=callback.from_user.id,
+            chat_id=user_id,
             title="Мой Кореш Premium",
             description=f"Безлимит запросов и напоминаний на {PREMIUM_DAYS} дней",
-            payload=f"premium_{callback.from_user.id}_{PREMIUM_DAYS}",
+            payload=f"premium_{user_id}_{PREMIUM_DAYS}",
             provider_token="",
             currency="XTR",
-            prices=[LabeledPrice(label="Premium", amount=PREMIUM_PRICE_STARS)],
+            prices=[LabeledPrice(label="Premium", amount=price)],
         )
     except Exception as e:
         logging.error("Ошибка send_invoice: %s", e)
@@ -773,11 +882,16 @@ def check_reminder_limit(user_id: int) -> bool:
     if is_premium(user_id):
         return True
     limits = get_limits(user_id)
-    return limits["reminders_created"] < FREE_REMINDER_LIMIT
+    return limits["reminders_created"] < limits["reminder_limit"]
 
 
 async def reminder_limit_response(message: Message):
-    await message.answer(LIMIT_REMINDER_TEXT, reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
+    text = (
+        "🛑 *Лимит бесплатных напоминаний исчерпан.*\n\n"
+        f"Бесплатно: {FREE_REMINDER_LIMIT} напоминания в день.\n"
+        "Пригласи друга (/invite) или оформи Premium, чтобы ставить сколько нужно ⤵"
+    )
+    await message.answer(text, reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
 
 
 @dp.message(F.text.regexp(WORD_TIME_PATTERN))
@@ -917,18 +1031,32 @@ async def route_to_chat(message: Message):
         del recent_reminders[user_id]
         context = f"Только что было напоминание по задаче: «{task_text}». Пользователь отвечает нестандартно."
         if not is_premium(user_id):
+            limits = get_limits(user_id)
             current = increment_chat_requests(user_id)
-            if current > FREE_CHAT_LIMIT:
-                await message.answer(LIMIT_CHAT_TEXT, reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
+            if current > limits["chat_limit"]:
+                await message.answer(
+                    f"🛑 *Лимит запросов исчерпан.*\n\n"
+                    f"Бесплатно: {limits['chat_limit']} в день.\n"
+                    f"Пригласи друга (/invite) или оформи Premium ⤵",
+                    reply_markup=premium_menu_keyboard(),
+                    parse_mode="Markdown",
+                )
                 return
         answer = ask_groq(user_id, message.text, mode, extra_context=context)
         await message.answer(answer)
         return
 
     if not is_premium(user_id):
+        limits = get_limits(user_id)
         current = increment_chat_requests(user_id)
-        if current > FREE_CHAT_LIMIT:
-            await message.answer(LIMIT_CHAT_TEXT, reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
+        if current > limits["chat_limit"]:
+            await message.answer(
+                f"🛑 *Лимит запросов исчерпан.*\n\n"
+                f"Бесплатно: {limits['chat_limit']} в день.\n"
+                f"Пригласи друга (/invite) или оформи Premium ⤵",
+                reply_markup=premium_menu_keyboard(),
+                parse_mode="Markdown",
+            )
             return
 
     answer = ask_groq(user_id, message.text, mode)
@@ -938,19 +1066,34 @@ async def route_to_chat(message: Message):
 @dp.message(F.text)
 async def handle_message(message: Message):
     user_id = message.from_user.id
+
+    # Если это первое сообщение юзера и он пришёл по реф-ссылке — начисляем рефереру
+    if user_id in pending_referrals:
+        referrer_id = pending_referrals.pop(user_id)
+        success, msg = register_referral(user_id, referrer_id)
+        if success:
+            try:
+                await bot.send_message(
+                    chat_id=referrer_id,
+                    text=f"🎉 *Твой друг зашёл в бота!*\n\n{msg}!\n"
+                         f"Смотри свои бонусы в /invite 🤝",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logging.warning("Не смог уведомить реферера: %s", e)
+
     update_last_active(user_id)
+    mark_user_started(user_id)
 
     # Режим ввода промокода
     if user_id in awaiting_promo:
         text = message.text.strip()
 
-        # 1) Явный выход по ключевым словам
         if text.lower() in ("отмена", "выход", "cancel", "назад", "стоп", "/cancel"):
             awaiting_promo.discard(user_id)
             await message.answer("Ок, выходим из режима промокода 🤝", reply_markup=chat_keyboard())
             return
 
-        # 2) Если нажал кнопку меню — выходим из режима и обрабатываем кнопку
         menu_buttons = {"⚙️ Настройки", "⬅️ В чат", "💎 Premium"} | set(MODE_BUTTONS.keys())
         if text in menu_buttons:
             awaiting_promo.discard(user_id)
@@ -967,7 +1110,6 @@ async def handle_message(message: Message):
                 await message.answer(MODE_REPLIES[mode], reply_markup=settings_keyboard())
             return
 
-        # 3) Проверяем как промокод
         code = text.upper()
         if not re.match(r"^[A-Z0-9\-]{4,20}$", code):
             await message.answer(
