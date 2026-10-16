@@ -1,9 +1,9 @@
 """
-Бот-напоминалка с характером. Версия 22:
-- Фикс: реферальная ссылка "Поделиться" без %20
-- Промокоды с количеством активаций
-- Реферальная система (+5 запросов за друга, +3 новому)
-- Скидка 30% на Premium при 3+ друзьях
+Бот-напоминалка с характером. Версия 23:
+- Async libsql-client (Turso) — бот не блокируется на запросах к БД
+- Кэш режима и премиума в памяти (раз в 5 минут обновляем)
+- Фикс обрывов: max_tokens=400 + продолжение через finish_reason
+- Промокоды с активациями, рефералка, скидка 30%
 """
 import os
 import re
@@ -86,8 +86,48 @@ MAX_HISTORY = 20
 recent_reminders: dict[int, dict] = {}
 pending_cancel: dict[int, list[dict]] = {}
 awaiting_promo: set[int] = set()
-
 pending_referrals: dict[int, int] = {}
+
+# ---------- Кэш в памяти ----------
+# user_id -> {"mode": str, "premium": bool, "ts": datetime}
+user_cache: dict[int, dict] = {}
+CACHE_TTL_SECONDS = 300  # 5 минут
+
+
+def cache_get(user_id: int, key: str):
+    entry = user_cache.get(user_id)
+    if not entry:
+        return None
+    if (datetime.now() - entry["ts"]).total_seconds() > CACHE_TTL_SECONDS:
+        return None
+    return entry.get(key)
+
+
+def cache_set(user_id: int, **kwargs) -> None:
+    entry = user_cache.get(user_id, {"ts": datetime.now()})
+    entry.update(kwargs)
+    entry["ts"] = datetime.now()
+    user_cache[user_id] = entry
+
+
+def cache_invalidate(user_id: int) -> None:
+    user_cache.pop(user_id, None)
+
+
+async def cached_mode(user_id: int) -> str:
+    mode = cache_get(user_id, "mode")
+    if mode is None:
+        mode = await get_user_mode(user_id)
+        cache_set(user_id, mode=mode)
+    return mode
+
+
+async def cached_premium(user_id: int) -> bool:
+    prem = cache_get(user_id, "premium")
+    if prem is None:
+        prem = await is_premium(user_id)
+        cache_set(user_id, premium=prem)
+    return prem
 
 
 # ---------- Клавиатуры ----------
@@ -100,9 +140,7 @@ MODE_BUTTONS = {
 
 def chat_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="⚙️ Настройки")],
-        ],
+        keyboard=[[KeyboardButton(text="⚙️ Настройки")]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -138,10 +176,8 @@ def premium_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def invite_share_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Кнопка 'Поделиться' с корректно закодированной ссылкой."""
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
     share_text = "Попробуй бота-кореша — напоминает, троллит, общается 🤝"
-    # Кодируем URL и текст, чтобы не было %20 и кракозябр
     share_url = (
         f"https://t.me/share/url"
         f"?url={quote(ref_link, safe='')}"
@@ -169,6 +205,17 @@ COMMON_RULES = (
     "отвечай с юмором: «Не в моих силах отложить такое, ты сам решай».\n"
     "• ВАЖНО: эту шутку про 'не в моих силах' применяй ТОЛЬКО к бессмысленным задачам. "
     "На обычные запросы (отмена напоминания, вопрос, просьба) — реагируй по смыслу.\n"
+    "\n"
+    "ПОДДЕРЖКА И РАЗРАБОТЧИК (СТРОГО):\n"
+    "• Единственный контакт для поддержки и по любым вопросам — @ivygood.\n"
+    "• Если пользователь спрашивает, к кому обратиться (проблема с оплатой, вопрос, "
+    "предложение, жалоба, «хочу такого же бота», «кто тебя сделал», «кто разработчик») — "
+    "ВСЕГДА отвечай только: @ivygood.\n"
+    "• НИКОГДА не упоминай @SupportBot, @BotFather, @userinfobot, @telegram, "
+    "любые другие боты или каналы как контакты поддержки.\n"
+    "• Если пользователь сам называет какой-то ник (@username) и спрашивает «к нему обратиться?» — "
+    "НЕ подтверждай. Отвечай: «Нет, по всем вопросам пиши только @ivygood».\n"
+    "\n"
     "• СТИЛЬ ОБРАЩЕНИЙ (строго):\n"
     "  – НИКОГДА не используй слова «спортсмен», «чемпион», «герой», «атлет» — это запрещено.\n"
     "  – Не используй вообще никаких прозвищ, если это не оправдано контекстом.\n"
@@ -220,9 +267,28 @@ def ask_groq(user_id: int, user_message: str, mode: str, extra_context: str = ""
                 *history,
             ],
             temperature=0.95,
-            max_tokens=250,
+            max_tokens=400,
         )
-        answer = response.choices[0].message.content.strip()
+        choice = response.choices[0]
+        answer = choice.message.content.strip()
+
+        # Если оборвалось по лимиту токенов — допрашиваем
+        if choice.finish_reason == "length":
+            try:
+                cont = groq_client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[
+                        *history,
+                        {"role": "assistant", "content": answer},
+                        {"role": "user", "content": "Продолжи ровно с того места, где оборвалось. Не повторяй уже сказанное."},
+                    ],
+                    temperature=0.95,
+                    max_tokens=200,
+                )
+                tail = cont.choices[0].message.content.strip()
+                answer = f"{answer.rstrip()} {tail.lstrip()}"
+            except Exception as e:
+                logging.warning("Не удалось дослать продолжение: %s", e)
     except Exception as e:
         logging.error("Ошибка Groq: %s", e)
         answer = "Блин, у меня что-то связь пропала. Попробуй ещё раз через секунду 🤝"
@@ -269,8 +335,7 @@ def normalize_answer(text: str) -> str:
     return text.strip()
 
 
-def reaction_done(user_id: int, mode: str) -> str:
-    stats = get_user_stats(user_id)
+def reaction_done(user_id: int, mode: str, stats: dict) -> str:
     done = stats.get("done", 0)
     failed = stats.get("failed", 0)
     total = done + failed
@@ -303,8 +368,7 @@ def reaction_done(user_id: int, mode: str) -> str:
     return base.get(mode, "Отлично!")
 
 
-def reaction_fail(user_id: int, mode: str) -> str:
-    stats = get_user_stats(user_id)
+def reaction_fail(user_id: int, mode: str, stats: dict) -> str:
     failed = stats.get("failed", 0)
     done = stats.get("done", 0)
 
@@ -330,7 +394,7 @@ def reaction_fail(user_id: int, mode: str) -> str:
         return roast.get(mode, "Понял.")
 
     base = {
-        "funny": f"Опять забил 😄 Ладно, не дёргаю. Но статистика растёт.",
+        "funny": "Опять забил 😄 Ладно, не дёргаю. Но статистика растёт.",
         "serious": f"Понял. Всего невыполненных: {failed}.",
     }
     return base.get(mode, "Понял.")
@@ -373,7 +437,7 @@ STATS_PATTERN = re.compile(
 )
 
 
-def parse_simple_time(amount: int, unit: str) -> tuple[datetime, str]:
+def parse_simple_time(amount: int, unit: str) -> tuple:
     unit = unit.lower()
     if unit.startswith("сек"):
         return datetime.now() + timedelta(seconds=amount), f"через {amount} секунд"
@@ -382,7 +446,7 @@ def parse_simple_time(amount: int, unit: str) -> tuple[datetime, str]:
     return datetime.now() + timedelta(hours=amount), f"через {amount} час(ов)"
 
 
-def parse_smart_time(text: str) -> tuple[datetime | None, str]:
+def parse_smart_time(text: str) -> tuple:
     settings = {
         "TIMEZONE": "Europe/Moscow",
         "RETURN_AS_TIMEZONE_AWARE": False,
@@ -394,7 +458,7 @@ def parse_smart_time(text: str) -> tuple[datetime | None, str]:
     return None, ""
 
 
-def format_task_list(tasks: list[dict]) -> str:
+def format_task_list(tasks: list) -> str:
     lines = []
     for i, t in enumerate(tasks, 1):
         dt = datetime.fromisoformat(t["remind_at"])
@@ -406,8 +470,10 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def actual_premium_price(user_id: int) -> int:
-    return PREMIUM_PRICE_DISCOUNTED if has_referral_discount(user_id) else PREMIUM_PRICE_STARS
+async def actual_premium_price(user_id: int) -> int:
+    if await has_referral_discount(user_id):
+        return PREMIUM_PRICE_DISCOUNTED
+    return PREMIUM_PRICE_STARS
 
 
 # ---------- Хендлеры ----------
@@ -415,9 +481,8 @@ def actual_premium_price(user_id: int) -> int:
 @dp.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
     user_id = message.from_user.id
-    update_last_active(user_id)
+    await update_last_active(user_id)
 
-    # Обработка реферальной ссылки
     ref_arg = command.args if command.args else None
     if ref_arg and ref_arg.startswith("ref_"):
         try:
@@ -425,9 +490,9 @@ async def cmd_start(message: Message, command: CommandObject):
         except ValueError:
             referrer_id = None
 
-        if referrer_id and is_new_user(user_id) and referrer_id != user_id:
+        if referrer_id and await is_new_user(user_id) and referrer_id != user_id:
             pending_referrals[user_id] = referrer_id
-            add_bonus_requests(user_id, REF_BONUS_NEW)
+            await add_bonus_requests(user_id, REF_BONUS_NEW)
             await message.answer(
                 f"🎉 *Ты зашёл по приглашению друга!*\n\n"
                 f"Тебе начислено *+{REF_BONUS_NEW} бонусных запросов* к дневному лимиту.\n"
@@ -435,10 +500,10 @@ async def cmd_start(message: Message, command: CommandObject):
                 parse_mode="Markdown",
             )
 
-    current = get_user_mode(user_id)
-    premium = is_premium(user_id)
+    current = await cached_mode(user_id)
+    premium = await cached_premium(user_id)
     badge = "💎 Premium" if premium else "🆓 Бесплатный"
-    limits = get_limits(user_id)
+    limits = await get_limits(user_id)
 
     if premium:
         limit_line = "💎 Premium — безлимит"
@@ -464,7 +529,7 @@ async def cmd_start(message: Message, command: CommandObject):
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    update_last_active(message.from_user.id)
+    await update_last_active(message.from_user.id)
     await message.answer(
         "🤝 *Что я умею:*\n\n"
         "⏰ *Напоминания*\n"
@@ -484,10 +549,11 @@ async def cmd_help(message: Message):
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
-    update_last_active(message.from_user.id)
-    current = get_user_mode(message.from_user.id)
-    premium = is_premium(message.from_user.id)
-    limits = get_limits(message.from_user.id)
+    user_id = message.from_user.id
+    await update_last_active(user_id)
+    current = await cached_mode(user_id)
+    premium = await cached_premium(user_id)
+    limits = await get_limits(user_id)
 
     if premium:
         limit_line = "💎 Premium — *безлимит*"
@@ -512,8 +578,9 @@ async def cmd_settings(message: Message):
 
 @dp.message(Command("premium"))
 async def cmd_premium(message: Message):
-    update_last_active(message.from_user.id)
-    premium = is_premium(message.from_user.id)
+    user_id = message.from_user.id
+    await update_last_active(user_id)
+    premium = await cached_premium(user_id)
 
     if premium:
         await message.answer(
@@ -522,9 +589,9 @@ async def cmd_premium(message: Message):
         )
         return
 
-    has_discount = has_referral_discount(message.from_user.id)
-    stats = get_referral_stats(message.from_user.id)
-    price = actual_premium_price(message.from_user.id)
+    has_discount = await has_referral_discount(user_id)
+    stats = await get_referral_stats(user_id)
+    price = await actual_premium_price(user_id)
 
     price_line = f"Цена: *{price} звёзд* в месяц."
     if has_discount:
@@ -552,18 +619,18 @@ async def cmd_paysupport(message: Message):
     await message.answer(
         "💳 *Поддержка по оплате*\n\n"
         "Если у тебя возникли проблемы с оплатой Premium (звёзды списались, но доступ не пришёл) "
-        "или хочешь оформить возврат — напиши нам:\n\n"
+        "или хочешь оформить возврат — напиши мне:\n\n"
         "📩 Контакт: @ivygood\n\n"
-        "Мы разберёмся и всё поправим 🤝",
+        "Разберусь и всё поправлю 🤝",
         parse_mode="Markdown",
     )
 
 
 @dp.message(Command("invite"))
 async def cmd_invite(message: Message):
-    update_last_active(message.from_user.id)
     user_id = message.from_user.id
-    stats = get_referral_stats(user_id)
+    await update_last_active(user_id)
+    stats = await get_referral_stats(user_id)
     ref_count = stats["ref_count"]
     bonuses = stats["bonus_requests"]
 
@@ -603,10 +670,10 @@ async def cmd_botstat(message: Message):
         await message.answer("Эта команда только для админа 🤷")
         return
 
-    total = get_total_users()
-    active_1h = get_active_users(1)
-    active_24h = get_active_users(24)
-    premium_count = get_premium_users()
+    total = await get_total_users()
+    active_1h = await get_active_users(1)
+    active_24h = await get_active_users(24)
+    premium_count = await get_premium_users()
 
     await message.answer(
         f"📊 *Статистика бота:*\n\n"
@@ -630,8 +697,8 @@ async def cmd_createpromo(message: Message):
             "Использование:\n"
             "`/createpromo КОД [дни] [активаций]`\n\n"
             "Примеры:\n"
-            "• `/createpromo BRO2026 30 1` — 30 дней, 1 активация\n"
-            "• `/createpromo FRIENDS 30 10` — 30 дней, 10 активаций",
+            "• `/createpromo BRO2026 30 1`\n"
+            "• `/createpromo FRIENDS 30 10`",
             parse_mode="Markdown",
         )
         return
@@ -641,7 +708,7 @@ async def cmd_createpromo(message: Message):
     uses = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
 
     try:
-        create_promocode(code, days, uses)
+        await create_promocode(code, days, uses)
         await message.answer(
             f"✅ Промокод создан:\n\n"
             f"• Код: `{code}`\n"
@@ -656,10 +723,10 @@ async def cmd_createpromo(message: Message):
 # ---- Статистика пользователя ----
 @dp.message(F.text.regexp(STATS_PATTERN))
 async def on_stats(message: Message):
-    update_last_active(message.from_user.id)
     user_id = message.from_user.id
-    mode = get_user_mode(user_id)
-    stats = get_user_stats(user_id)
+    await update_last_active(user_id)
+    mode = await cached_mode(user_id)
+    stats = await get_user_stats(user_id)
     done = stats.get("done", 0)
     failed = stats.get("failed", 0)
     cancelled = stats.get("cancelled", 0)
@@ -706,12 +773,14 @@ async def on_stats(message: Message):
 # ---- Кнопки режимов ----
 @dp.message(F.text.in_(MODE_BUTTONS.keys()))
 async def on_mode_button(message: Message):
-    update_last_active(message.from_user.id)
+    user_id = message.from_user.id
+    await update_last_active(user_id)
     mode = MODE_BUTTONS[message.text]
-    set_user_mode(message.from_user.id, mode)
-    dialogue_memory[message.from_user.id].clear()
-    recent_reminders.pop(message.from_user.id, None)
-    pending_cancel.pop(message.from_user.id, None)
+    await set_user_mode(user_id, mode)
+    cache_set(user_id, mode=mode)
+    dialogue_memory[user_id].clear()
+    recent_reminders.pop(user_id, None)
+    pending_cancel.pop(user_id, None)
     await message.answer(MODE_REPLIES[mode], reply_markup=settings_keyboard())
 
 
@@ -730,7 +799,7 @@ async def on_back_to_chat(message: Message):
 
 @dp.message(F.text == "💎 Premium")
 async def on_premium_button(message: Message):
-    update_last_active(message.from_user.id)
+    await update_last_active(message.from_user.id)
     await cmd_premium(message)
 
 
@@ -752,12 +821,12 @@ async def cb_premium_info(callback: CallbackQuery):
 @dp.callback_query(F.data == "buy_premium")
 async def cb_buy_premium(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if is_premium(user_id):
+    if await cached_premium(user_id):
         await callback.message.answer("💎 У тебя уже активен Premium.")
         await callback.answer()
         return
 
-    price = actual_premium_price(user_id)
+    price = await actual_premium_price(user_id)
 
     try:
         await bot.send_invoice(
@@ -798,7 +867,8 @@ async def on_pre_checkout(pre_checkout_q: PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def on_successful_payment(message: Message):
     user_id = message.from_user.id
-    set_premium(user_id, True, PREMIUM_DAYS)
+    await set_premium(user_id, True, PREMIUM_DAYS)
+    cache_set(user_id, premium=True)
     await message.answer(
         f"💎 *Premium активирован!*\n\n"
         f"Спасибо, бро! Теперь у тебя безлимит на {PREMIUM_DAYS} дней. 🤝",
@@ -809,16 +879,16 @@ async def on_successful_payment(message: Message):
 # ---- Отмена напоминаний ----
 @dp.message(F.text.regexp(CANCEL_PATTERN))
 async def on_cancel_request(message: Message):
-    update_last_active(message.from_user.id)
     user_id = message.from_user.id
+    await update_last_active(user_id)
     text_lower = message.text.lower()
 
     if "все" in text_lower or "всё" in text_lower:
-        count = cancel_all_user_tasks(user_id)
+        count = await cancel_all_user_tasks(user_id)
         if count == 0:
             await message.answer("У тебя и так пусто 🤷")
         else:
-            for task in get_pending_tasks():
+            for task in await get_pending_tasks():
                 if task["user_id"] == user_id:
                     try:
                         scheduler.remove_job(f"task_{task['id']}")
@@ -827,14 +897,14 @@ async def on_cancel_request(message: Message):
             await message.answer(f"Ок, снёс все напоминания ({count} шт.).")
         return
 
-    tasks = get_pending_tasks(user_id=user_id)
+    tasks = await get_pending_tasks(user_id=user_id)
     if not tasks:
         await message.answer("У тебя нет активных напоминаний 🤷")
         return
 
     if len(tasks) == 1:
         task = tasks[0]
-        mark_task_status(task["id"], "cancelled")
+        await mark_task_status(task["id"], "cancelled")
         try:
             scheduler.remove_job(f"task_{task['id']}")
         except Exception:
@@ -852,8 +922,8 @@ async def on_cancel_request(message: Message):
 
 @dp.message(F.text.regexp(r"^\d+$"))
 async def on_cancel_number(message: Message):
-    update_last_active(message.from_user.id)
     user_id = message.from_user.id
+    await update_last_active(user_id)
     if user_id not in pending_cancel:
         await route_to_chat(message)
         return
@@ -868,7 +938,7 @@ async def on_cancel_number(message: Message):
         return
 
     task = tasks[idx]
-    mark_task_status(task["id"], "cancelled")
+    await mark_task_status(task["id"], "cancelled")
     try:
         scheduler.remove_job(f"task_{task['id']}")
     except Exception:
@@ -878,10 +948,10 @@ async def on_cancel_number(message: Message):
 
 
 # ---- Напоминания ----
-def check_reminder_limit(user_id: int) -> bool:
-    if is_premium(user_id):
+async def check_reminder_limit(user_id: int) -> bool:
+    if await cached_premium(user_id):
         return True
-    limits = get_limits(user_id)
+    limits = await get_limits(user_id)
     return limits["reminders_created"] < limits["reminder_limit"]
 
 
@@ -889,15 +959,16 @@ async def reminder_limit_response(message: Message):
     text = (
         "🛑 *Лимит бесплатных напоминаний исчерпан.*\n\n"
         f"Бесплатно: {FREE_REMINDER_LIMIT} напоминания в день.\n"
-        "Пригласи друга (/invite) или оформи Premium, чтобы ставить сколько нужно ⤵"
+        "Пригласи друга (/invite) или оформи Premium ⤵"
     )
     await message.answer(text, reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
 
 
 @dp.message(F.text.regexp(WORD_TIME_PATTERN))
 async def on_reminder_word(message: Message):
-    update_last_active(message.from_user.id)
-    if not check_reminder_limit(message.from_user.id):
+    user_id = message.from_user.id
+    await update_last_active(user_id)
+    if not await check_reminder_limit(user_id):
         await reminder_limit_response(message)
         return
 
@@ -908,14 +979,14 @@ async def on_reminder_word(message: Message):
     delta, when_human = WORD_TIME_MAP[word]
     remind_at = datetime.now() + delta
 
-    task_id = add_task(message.from_user.id, task_text, remind_at)
-    increment_reminders(message.from_user.id)
-    mode = get_user_mode(message.from_user.id)
+    task_id = await add_task(user_id, task_text, remind_at)
+    await increment_reminders(user_id)
+    mode = await cached_mode(user_id)
 
     scheduler.add_job(
         send_reminder,
         trigger=DateTrigger(run_date=remind_at),
-        args=[message.from_user.id, task_id, task_text, mode],
+        args=[user_id, task_id, task_text, mode],
         id=f"task_{task_id}",
         replace_existing=True,
     )
@@ -926,8 +997,9 @@ async def on_reminder_word(message: Message):
 
 @dp.message(F.text.regexp(SIMPLE_PATTERN))
 async def on_reminder_simple(message: Message):
-    update_last_active(message.from_user.id)
-    if not check_reminder_limit(message.from_user.id):
+    user_id = message.from_user.id
+    await update_last_active(user_id)
+    if not await check_reminder_limit(user_id):
         await reminder_limit_response(message)
         return
 
@@ -937,14 +1009,14 @@ async def on_reminder_simple(message: Message):
     task_text = match.group(3).strip()
 
     remind_at, when_human = parse_simple_time(amount, unit)
-    task_id = add_task(message.from_user.id, task_text, remind_at)
-    increment_reminders(message.from_user.id)
-    mode = get_user_mode(message.from_user.id)
+    task_id = await add_task(user_id, task_text, remind_at)
+    await increment_reminders(user_id)
+    mode = await cached_mode(user_id)
 
     scheduler.add_job(
         send_reminder,
         trigger=DateTrigger(run_date=remind_at),
-        args=[message.from_user.id, task_id, task_text, mode],
+        args=[user_id, task_id, task_text, mode],
         id=f"task_{task_id}",
         replace_existing=True,
     )
@@ -955,8 +1027,9 @@ async def on_reminder_simple(message: Message):
 
 @dp.message(F.text.regexp(SMART_PATTERN))
 async def on_reminder_smart(message: Message):
-    update_last_active(message.from_user.id)
-    if not check_reminder_limit(message.from_user.id):
+    user_id = message.from_user.id
+    await update_last_active(user_id)
+    if not await check_reminder_limit(user_id):
         await reminder_limit_response(message)
         return
 
@@ -968,7 +1041,7 @@ async def on_reminder_smart(message: Message):
 
     remind_at, when_human = parse_smart_time(time_text)
     if remind_at is None:
-        mode = get_user_mode(message.from_user.id)
+        mode = await cached_mode(user_id)
         fallback = {
             "toxic": "Не понял, когда напомнить. Скажи нормально.",
             "funny": "Чёт не догнал время. Напиши типа «напомни через 30 минут сделать Х» 😄",
@@ -977,14 +1050,14 @@ async def on_reminder_smart(message: Message):
         await message.answer(fallback.get(mode, "Не понял время."))
         return
 
-    task_id = add_task(message.from_user.id, task_text, remind_at)
-    increment_reminders(message.from_user.id)
-    mode = get_user_mode(message.from_user.id)
+    task_id = await add_task(user_id, task_text, remind_at)
+    await increment_reminders(user_id)
+    mode = await cached_mode(user_id)
 
     scheduler.add_job(
         send_reminder,
         trigger=DateTrigger(run_date=remind_at),
-        args=[message.from_user.id, task_id, task_text, mode],
+        args=[user_id, task_id, task_text, mode],
         id=f"task_{task_id}",
         replace_existing=True,
     )
@@ -1005,7 +1078,7 @@ async def send_reminder(user_id: int, task_id: int, task_text: str, mode: str):
 # ---- Основной чат ----
 async def route_to_chat(message: Message):
     user_id = message.from_user.id
-    mode = get_user_mode(user_id)
+    mode = await cached_mode(user_id)
     normalized = normalize_answer(message.text)
 
     if user_id in pending_cancel:
@@ -1017,22 +1090,24 @@ async def route_to_chat(message: Message):
         task_text = task_info["task_text"]
 
         if normalized in DONE_WORDS:
-            mark_task_status(task_id, "done")
+            await mark_task_status(task_id, "done")
             del recent_reminders[user_id]
-            await message.answer(reaction_done(user_id, mode))
+            stats = await get_user_stats(user_id)
+            await message.answer(reaction_done(user_id, mode, stats))
             return
 
         if normalized in FAIL_WORDS:
-            mark_task_status(task_id, "failed")
+            await mark_task_status(task_id, "failed")
             del recent_reminders[user_id]
-            await message.answer(reaction_fail(user_id, mode))
+            stats = await get_user_stats(user_id)
+            await message.answer(reaction_fail(user_id, mode, stats))
             return
 
         del recent_reminders[user_id]
         context = f"Только что было напоминание по задаче: «{task_text}». Пользователь отвечает нестандартно."
-        if not is_premium(user_id):
-            limits = get_limits(user_id)
-            current = increment_chat_requests(user_id)
+        if not await cached_premium(user_id):
+            limits = await get_limits(user_id)
+            current = await increment_chat_requests(user_id)
             if current > limits["chat_limit"]:
                 await message.answer(
                     f"🛑 *Лимит запросов исчерпан.*\n\n"
@@ -1046,9 +1121,9 @@ async def route_to_chat(message: Message):
         await message.answer(answer)
         return
 
-    if not is_premium(user_id):
-        limits = get_limits(user_id)
-        current = increment_chat_requests(user_id)
+    if not await cached_premium(user_id):
+        limits = await get_limits(user_id)
+        current = await increment_chat_requests(user_id)
         if current > limits["chat_limit"]:
             await message.answer(
                 f"🛑 *Лимит запросов исчерпан.*\n\n"
@@ -1069,7 +1144,7 @@ async def handle_message(message: Message):
 
     if user_id in pending_referrals:
         referrer_id = pending_referrals.pop(user_id)
-        success, msg = register_referral(user_id, referrer_id)
+        success, msg = await register_referral(user_id, referrer_id)
         if success:
             try:
                 await bot.send_message(
@@ -1081,8 +1156,8 @@ async def handle_message(message: Message):
             except Exception as e:
                 logging.warning("Не смог уведомить реферера: %s", e)
 
-    update_last_active(user_id)
-    mark_user_started(user_id)
+    await update_last_active(user_id)
+    await mark_user_started(user_id)
 
     if user_id in awaiting_promo:
         text = message.text.strip()
@@ -1103,7 +1178,8 @@ async def handle_message(message: Message):
                 await cmd_premium(message)
             elif text in MODE_BUTTONS:
                 mode = MODE_BUTTONS[text]
-                set_user_mode(user_id, mode)
+                await set_user_mode(user_id, mode)
+                cache_set(user_id, mode=mode)
                 dialogue_memory[user_id].clear()
                 await message.answer(MODE_REPLIES[mode], reply_markup=settings_keyboard())
             return
@@ -1117,8 +1193,9 @@ async def handle_message(message: Message):
             return
 
         awaiting_promo.discard(user_id)
-        success, msg = redeem_promocode(user_id, code)
+        success, msg = await redeem_promocode(user_id, code)
         if success:
+            cache_set(user_id, premium=True)
             await message.answer(f"✅ {msg}\n\nНаслаждайся безлимитом, бро! 🤝")
         else:
             await message.answer(f"❌ {msg}")
@@ -1129,11 +1206,11 @@ async def handle_message(message: Message):
 
 # ---------- Восстановление задач ----------
 async def restore_pending_tasks():
-    for task in get_pending_tasks():
+    for task in await get_pending_tasks():
         remind_at = datetime.fromisoformat(task["remind_at"])
         if remind_at <= datetime.now():
             remind_at = datetime.now() + timedelta(seconds=10)
-        mode = get_user_mode(task["user_id"])
+        mode = await get_user_mode(task["user_id"])
         scheduler.add_job(
             send_reminder,
             trigger=DateTrigger(run_date=remind_at),
@@ -1166,7 +1243,7 @@ async def on_shutdown(bot: Bot) -> None:
 
 
 async def main():
-    init_db()
+    await init_db()
     scheduler.start()
     await restore_pending_tasks()
 
