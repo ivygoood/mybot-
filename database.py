@@ -1,21 +1,35 @@
 """
-Работа с SQLite: пользователи + задачи + статистика + промокоды + лимиты + рефералы.
+Работа с облачной базой данных Turso (libSQL).
+Данные живут на серверах Turso и НЕ стираются при деплое Render.
 """
-import sqlite3
+import os
+import libsql
 from datetime import datetime, timedelta
 from typing import Optional
 
-DB_PATH = "bot_data.db"
+TURSO_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+
+if not TURSO_URL or not TURSO_TOKEN:
+    raise RuntimeError(
+        "Не заданы переменные окружения TURSO_DATABASE_URL и TURSO_AUTH_TOKEN"
+    )
 
 # Бонусы и скидки
-REF_BONUS_REFERRER = 5         # +5 запросов тому, кто привёл
-REF_BONUS_NEW = 3              # +3 запроса новому
-REF_DISCOUNT_THRESHOLD = 3     # с 3 друзей — скидка
-REF_DISCOUNT_PERCENT = 30      # 30%
+REF_BONUS_REFERRER = 5
+REF_BONUS_NEW = 3
+REF_DISCOUNT_THRESHOLD = 3
+REF_DISCOUNT_PERCENT = 30
+
+
+def get_connection() -> libsql.Connection:
+    """Возвращает соединение с облачной базой Turso."""
+    return libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
 
 
 def init_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
+    """Создаёт таблицы, если их ещё нет."""
+    conn = get_connection()
     cur = conn.cursor()
 
     cur.execute("""
@@ -70,7 +84,7 @@ def init_db() -> None:
     """)
     conn.commit()
 
-    # Миграция: добавляем колонки, если их нет (для существующих БД)
+    # Миграция: добавляем колонки, если их нет
     for col, table in [
         ("bonus_requests", "users"),
         ("ref_count", "users"),
@@ -82,7 +96,7 @@ def init_db() -> None:
         try:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} INTEGER DEFAULT 0")
             conn.commit()
-        except sqlite3.OperationalError:
+        except Exception:
             pass  # колонка уже есть
 
     conn.close()
@@ -91,7 +105,7 @@ def init_db() -> None:
 # ---------- Режимы ----------
 
 def get_user_mode(user_id: int) -> str:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT mode FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -100,7 +114,7 @@ def get_user_mode(user_id: int) -> str:
 
 
 def set_user_mode(user_id: int, mode: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO users (user_id, mode) VALUES (?, ?)
@@ -113,7 +127,7 @@ def set_user_mode(user_id: int, mode: str) -> None:
 # ---------- Премиум ----------
 
 def is_premium(user_id: int) -> bool:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT premium, premium_until FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -130,7 +144,7 @@ def is_premium(user_id: int) -> bool:
 
 
 def set_premium(user_id: int, active: bool, days: int = 30) -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     until = (datetime.now() + timedelta(days=days)).isoformat() if active else None
     cur.execute("""
@@ -152,7 +166,7 @@ def get_today_str() -> str:
 
 
 def get_limits(user_id: int) -> dict:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         "SELECT chat_requests, reminders_created FROM user_limits WHERE user_id = ? AND date = ?",
@@ -177,7 +191,7 @@ def get_limits(user_id: int) -> dict:
 
 
 def increment_chat_requests(user_id: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     today = get_today_str()
     cur.execute("""
@@ -192,7 +206,7 @@ def increment_chat_requests(user_id: int) -> int:
 
 
 def increment_reminders(user_id: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     today = get_today_str()
     cur.execute("""
@@ -207,8 +221,7 @@ def increment_reminders(user_id: int) -> int:
 
 
 def add_bonus_requests(user_id: int, amount: int) -> None:
-    """Начисляет бонусные запросы (складываются с дневным лимитом)."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO users (user_id, bonus_requests) VALUES (?, ?)
@@ -221,7 +234,7 @@ def add_bonus_requests(user_id: int, amount: int) -> None:
 # ---------- Активность ----------
 
 def update_last_active(user_id: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         "UPDATE users SET last_active = ? WHERE user_id = ?",
@@ -237,7 +250,7 @@ def update_last_active(user_id: int) -> None:
 
 
 def get_total_users() -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM users")
     total = cur.fetchone()[0]
@@ -246,7 +259,7 @@ def get_total_users() -> int:
 
 
 def get_active_users(hours: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     threshold = (datetime.now() - timedelta(hours=hours)).isoformat()
     cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (threshold,))
@@ -256,7 +269,7 @@ def get_active_users(hours: int) -> int:
 
 
 def get_premium_users() -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     now = datetime.now().isoformat()
     cur.execute(
@@ -271,8 +284,7 @@ def get_premium_users() -> int:
 # ---------- Рефералы ----------
 
 def is_new_user(user_id: int) -> bool:
-    """True, если пользователь ещё ни разу не писал боту."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT started_once FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -281,8 +293,7 @@ def is_new_user(user_id: int) -> bool:
 
 
 def mark_user_started(user_id: int) -> None:
-    """Помечаем, что юзер уже активировался (писал боту)."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO users (user_id, started_once) VALUES (?, 1)
@@ -293,35 +304,28 @@ def mark_user_started(user_id: int) -> None:
 
 
 def register_referral(new_user_id: int, referrer_id: int) -> tuple[bool, str]:
-    """
-    Обрабатывает реферала. Возвращает (успех, сообщение для реферера).
-    Засчитывается ТОЛЬКО если новый юзер реально новый и referrer не он сам.
-    """
     if new_user_id == referrer_id:
         return False, "Нельзя пригласить самого себя."
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
 
-    # Проверяем, что приглашённый ещё не в базе как активный
     cur.execute("SELECT started_once, referred_by FROM users WHERE user_id = ?", (new_user_id,))
     row = cur.fetchone()
 
-    if row and row[0]:  # уже был в боте
+    if row and row[0]:
         conn.close()
         return False, "Этот пользователь уже пользуется ботом."
 
-    if row and row[1]:  # уже был привязан к кому-то
+    if row and row[1]:
         conn.close()
         return False, "Этот пользователь уже был приглашён."
 
-    # Записываем связь
     cur.execute("""
         INSERT INTO users (user_id, referred_by, started_once) VALUES (?, ?, 0)
         ON CONFLICT(user_id) DO UPDATE SET referred_by = excluded.referred_by
     """, (new_user_id, referrer_id))
 
-    # Начисляем бонус рефереру
     cur.execute("""
         INSERT INTO users (user_id, bonus_requests, ref_count) VALUES (?, ?, 1)
         ON CONFLICT(user_id) DO UPDATE SET
@@ -335,7 +339,7 @@ def register_referral(new_user_id: int, referrer_id: int) -> tuple[bool, str]:
 
 
 def get_referral_stats(user_id: int) -> dict:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT ref_count, bonus_requests FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -346,7 +350,6 @@ def get_referral_stats(user_id: int) -> dict:
 
 
 def has_referral_discount(user_id: int) -> bool:
-    """True, если у юзера 3+ друзей → скидка на Premium."""
     stats = get_referral_stats(user_id)
     return stats["ref_count"] >= REF_DISCOUNT_THRESHOLD
 
@@ -354,7 +357,7 @@ def has_referral_discount(user_id: int) -> bool:
 # ---------- Промокоды ----------
 
 def create_promocode(code: str, days: int = 30, uses: int = 1) -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO promocodes (code, days, uses_left, total_uses, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -366,7 +369,7 @@ def create_promocode(code: str, days: int = 30, uses: int = 1) -> None:
 
 def redeem_promocode(user_id: int, code: str) -> tuple[bool, str]:
     code = code.upper().strip()
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT days, uses_left FROM promocodes WHERE code = ?", (code,))
     row = cur.fetchone()
@@ -380,13 +383,11 @@ def redeem_promocode(user_id: int, code: str) -> tuple[bool, str]:
         conn.close()
         return False, "Этот промокод уже исчерпан."
 
-    # Проверяем, не активировал ли уже этот юзер код
     cur.execute("SELECT 1 FROM promocode_redemptions WHERE code = ? AND user_id = ?", (code, user_id))
     if cur.fetchone():
         conn.close()
         return False, "Ты уже использовал этот промокод."
 
-    # Списываем использование
     cur.execute("UPDATE promocodes SET uses_left = uses_left - 1 WHERE code = ?", (code,))
     cur.execute(
         "INSERT INTO promocode_redemptions (code, user_id, redeemed_at) VALUES (?, ?, ?)",
@@ -402,20 +403,21 @@ def redeem_promocode(user_id: int, code: str) -> tuple[bool, str]:
 # ---------- Задачи ----------
 
 def add_task(user_id: int, text: str, remind_at: datetime) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO tasks (user_id, text, remind_at) VALUES (?, ?, ?)",
         (user_id, text, remind_at.isoformat())
     )
-    task_id = cur.lastrowid
     conn.commit()
+    # lastrowid в libsql доступен через атрибут курсора
+    task_id = cur.lastrowid
     conn.close()
     return task_id
 
 
 def get_pending_tasks(user_id: Optional[int] = None) -> list[dict]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     if user_id is None:
         cur.execute("SELECT id, user_id, text, remind_at FROM tasks WHERE status = 'pending'")
@@ -433,7 +435,7 @@ def get_pending_tasks(user_id: Optional[int] = None) -> list[dict]:
 
 
 def get_task_by_id(task_id: int) -> Optional[dict]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT id, user_id, text, remind_at, status FROM tasks WHERE id = ?", (task_id,))
     row = cur.fetchone()
@@ -444,7 +446,7 @@ def get_task_by_id(task_id: int) -> Optional[dict]:
 
 
 def update_task_remind_at(task_id: int, remind_at: datetime) -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("UPDATE tasks SET remind_at = ? WHERE id = ?", (remind_at.isoformat(), task_id))
     conn.commit()
@@ -452,7 +454,7 @@ def update_task_remind_at(task_id: int, remind_at: datetime) -> None:
 
 
 def mark_task_status(task_id: int, status: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
     conn.commit()
@@ -460,7 +462,7 @@ def mark_task_status(task_id: int, status: str) -> None:
 
 
 def cancel_all_user_tasks(user_id: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         "UPDATE tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'",
@@ -475,7 +477,7 @@ def cancel_all_user_tasks(user_id: int) -> int:
 # ---------- Статистика ----------
 
 def get_user_stats(user_id: int) -> dict:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT status, COUNT(*) FROM tasks WHERE user_id = ? GROUP BY status", (user_id,))
     rows = cur.fetchall()
