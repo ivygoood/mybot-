@@ -1,10 +1,8 @@
 """
-Бот-напоминалка с характером. Версия 0.24.1:
-- Мужской голос через edge-tts (ru-RU-DmitryNeural)
+Бот-напоминалка с характером. Версия 0.24.2:
+- Фикс кнопок (теперь не улетают в LLM)
+- Мужской голос через edge-tts (патч 403 ошибки)
 - Голосовой ввод (STT через Groq Whisper)
-- Голосовой вывод (TTS через edge-tts)
-- Переключатель голосового режима
-- Умное распознавание ответов (LLM)
 - Ультра-токсичный режим
 """
 import os
@@ -20,6 +18,7 @@ import dateparser
 import edge_tts
 import edge_tts.constants
 import edge_tts.communicate
+from aiohttp import web
 
 # ПРИНУДИТЕЛЬНЫЙ ФИКС 403 ОШИБКИ (Microsoft сменил сервер в окт. 2026)
 NEW_WSS_URL = (
@@ -29,7 +28,6 @@ NEW_WSS_URL = (
 edge_tts.constants.WSS_URL = NEW_WSS_URL
 edge_tts.communicate.WSS_URL = NEW_WSS_URL
 # -----------------------------------------------------------------
-from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
@@ -223,9 +221,7 @@ def transcribe_voice(file_path: str) -> str:
         return ""
 
 async def text_to_speech(text: str) -> io.BytesIO:
-    """Озвучивает текст мужским голосом через edge-tts."""
     try:
-        # ru-RU-DmitryNeural — мужской русский голос
         communicate = edge_tts.Communicate(text, "ru-RU-DmitryNeural")
         audio_data = b""
         async for chunk in communicate.stream():
@@ -562,7 +558,33 @@ async def handle_reminders(message: Message, text: str):
 @dp.message(F.text)
 async def handle_msg(message: Message):
     uid = message.from_user.id
+    text = message.text.strip()
 
+    # 1. ЗАЩИТА ОТ КНОПОК (теперь они не улетают в LLM)
+    if text in MODE_BUTTONS:
+        await update_last_active(uid)
+        mode = MODE_BUTTONS[text]
+        await set_user_mode(uid, mode)
+        cache_set(uid, mode=mode)
+        dialogue_memory[uid].clear()
+        recent_reminders.pop(uid, None)
+        pending_cancel.pop(uid, None)
+        await message.answer(MODE_REPLIES[mode], reply_markup=settings_keyboard())
+        return
+
+    if text == "⚙️ Настройки":
+        await cmd_settings(message)
+        return
+
+    if text == "⬅️ В чат":
+        await message.answer("Ок, вернулся в обычный режим. Просто пиши мне что угодно 🤝", reply_markup=chat_keyboard())
+        return
+
+    if text == "💎 Premium":
+        await cmd_premium(message)
+        return
+
+    # 2. Дальше идет обычная логика
     if uid in pending_referrals:
         ref_id = pending_referrals.pop(uid)
         success, msg = await register_referral(uid, ref_id)
@@ -574,18 +596,8 @@ async def handle_msg(message: Message):
     await mark_user_started(uid)
 
     if uid in awaiting_promo:
-        text = message.text.strip()
         if text.lower() in ("отмена", "выход", "cancel", "назад", "стоп"):
             awaiting_promo.discard(uid); await message.answer("Ок, выходим 🤝", reply_markup=chat_keyboard()); return
-        menu_btns = {"⚙️ Настройки", "⬅️ В чат", "💎 Premium"} | set(MODE_BUTTONS.keys())
-        if text in menu_btns:
-            awaiting_promo.discard(uid)
-            if text == "⚙️ Настройки": await cmd_settings(message)
-            elif text == "⬅️ В чат": await message.answer("Ок 🤝", reply_markup=chat_keyboard())
-            elif text == "💎 Premium": await cmd_premium(message)
-            elif text in MODE_BUTTONS:
-                mode = MODE_BUTTONS[text]; await set_user_mode(uid, mode); cache_set(uid, mode=mode); dialogue_memory[uid].clear(); await message.answer(MODE_REPLIES[mode], reply_markup=settings_keyboard())
-            return
         code = text.upper()
         if not re.match(r"^[A-Z0-9\-]{4,20}$", code):
             await message.answer("Не похоже на промокод. Или напиши «отмена»."); return
@@ -595,10 +607,10 @@ async def handle_msg(message: Message):
         else: await message.answer(f"❌ {msg}")
         return
     
-    if await handle_reminders(message, message.text):
+    if await handle_reminders(message, text):
         return
 
-    await process_text_message(message, message.text)
+    await process_text_message(message, text)
 
 # ---------- Восстановление задач ----------
 async def restore_tasks():
