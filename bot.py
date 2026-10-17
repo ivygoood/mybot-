@@ -1,8 +1,9 @@
 """
-Бот-напоминалка с характером. Версия 0.24 (BIG UPDATE):
+Бот-напоминалка с характером. Версия 0.24.1:
+- Мужской голос через edge-tts (ru-RU-DmitryNeural)
 - Голосовой ввод (STT через Groq Whisper)
-- Голосовой вывод (TTS через gTTS)
-- Переключатель голосового режима ("общайся голосом" / "хватит")
+- Голосовой вывод (TTS через edge-tts)
+- Переключатель голосового режима
 - Умное распознавание ответов (LLM)
 - Ультра-токсичный режим
 """
@@ -16,8 +17,8 @@ from collections import defaultdict
 from urllib.parse import quote
 
 import dateparser
+import edge_tts
 from aiohttp import web
-from gtts import gTTS
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
@@ -197,7 +198,6 @@ def classify_answer_llm(text: str) -> str:
 
 # ---------- Утилиты для голоса ----------
 def transcribe_voice(file_path: str) -> str:
-    """Распознаёт голос через Groq Whisper."""
     try:
         with open(file_path, "rb") as file:
             transcription = groq_client.audio.transcriptions.create(
@@ -211,12 +211,16 @@ def transcribe_voice(file_path: str) -> str:
         logging.error("Whisper error: %s", e)
         return ""
 
-def text_to_speech(text: str) -> io.BytesIO:
-    """Озвучивает текст через gTTS."""
+async def text_to_speech(text: str) -> io.BytesIO:
+    """Озвучивает текст мужским голосом через edge-tts."""
     try:
-        tts = gTTS(text=text, lang='ru')
-        audio_fp = io.BytesIO()
-        tts.write_to_fp(audio_fp)
+        # ru-RU-DmitryNeural — мужской русский голос
+        communicate = edge_tts.Communicate(text, "ru-RU-DmitryNeural")
+        audio_data = b""
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data += chunk["data"]
+        audio_fp = io.BytesIO(audio_data)
         audio_fp.seek(0)
         return audio_fp
     except Exception as e:
@@ -399,20 +403,17 @@ async def on_voice(message: Message):
     uid = message.from_user.id
     await update_last_active(uid)
     
-    # Проверка лимита (только для входящих)
     if not await cached_premium(uid):
         limits = await get_limits(uid)
         if limits["voice_in"] >= limits["voice_in_limit"]:
             await message.answer(f"🛑 *Лимит голосовых на сегодня ({limits['voice_in_limit']} шт).*\n\nПригласи друга (/invite) или Premium ⤵", reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
             return
 
-    # Скачиваем файл
     file_id = message.voice.file_id
     file = await bot.get_file(file_id)
     file_path = f"/tmp/{uid}_{file_id}.ogg"
     await bot.download_file(file.file_path, destination=file_path)
 
-    # Расшифровка
     text = transcribe_voice(file_path)
     if not text:
         await message.answer("Не разобрал, что ты сказал. Попробуй ещё раз.")
@@ -420,10 +421,6 @@ async def on_voice(message: Message):
     
     await increment_voice_in(uid)
     await message.answer(f"🎙️ *Ты сказал:* «{text}»", parse_mode="Markdown")
-
-    # Обрабатываем как обычное сообщение
-    # (временно подменяем message.text, чтобы прогнать через логику)
-    # Но так как aiogram не даёт просто так подменить, мы вызовем нужные парсеры напрямую
     await process_text_message(message, text)
 
 
@@ -439,7 +436,7 @@ async def on_voice_off(message: Message):
     await message.answer("Ок, вернулся в текстовый режим.")
 
 
-# ---------- Основная логика (вынесена, чтобы работать и с текстом, и с голосом) ----------
+# ---------- Основная логика ----------
 async def process_text_message(message: Message, text: str):
     uid = message.from_user.id
     mode = await cached_mode(uid)
@@ -490,16 +487,15 @@ async def process_text_message(message: Message, text: str):
     
     answer = ask_groq(uid, text, mode)
     
-    # Отправка ответа (голосом или текстом)
     if await get_voice_mode(uid):
         if not await cached_premium(uid):
             limits = await get_limits(uid)
             if limits["voice_out"] >= limits["voice_out_limit"]:
-                await message.answer(answer) # Лимит голосовых кончился — шлем текстом
+                await message.answer(answer)
                 await message.answer(f"🛑 Лимит голосовых ответов на сегодня ({limits['voice_out_limit']} шт). Продолжаю текстом. Premium — безлимит ⤵", reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
                 return
         await increment_voice_out(uid)
-        audio_fp = text_to_speech(answer)
+        audio_fp = await text_to_speech(answer)
         if audio_fp:
             await message.answer_voice(BufferedInputFile(audio_fp.read(), filename="voice.mp3"))
         else:
@@ -508,9 +504,7 @@ async def process_text_message(message: Message, text: str):
         await message.answer(answer)
 
 
-# ---------- Хендлеры для напоминаний (нужно вызывать их и из текста, и из голоса) ----------
 async def handle_reminders(message: Message, text: str):
-    # Проверяем все парсеры. Если хоть один сработал — возвращаем True.
     uid = message.from_user.id
     
     match = WORD_TIME_PATTERN.search(text)
@@ -554,7 +548,6 @@ async def handle_reminders(message: Message, text: str):
     return False
 
 
-# ---------- Текстовый хендлер (главный) ----------
 @dp.message(F.text)
 async def handle_msg(message: Message):
     uid = message.from_user.id
@@ -591,11 +584,9 @@ async def handle_msg(message: Message):
         else: await message.answer(f"❌ {msg}")
         return
     
-    # Сначала проверяем, не напоминание ли это
     if await handle_reminders(message, message.text):
         return
 
-    # Если нет — идем в чат
     await process_text_message(message, message.text)
 
 # ---------- Восстановление задач ----------
