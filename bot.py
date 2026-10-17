@@ -1,8 +1,9 @@
 """
-Бот-напоминалка с характером. Версия 0.25:
-- Анализ картинок (фото) через Groq Vision (Qwen)
+Бот-напоминалка с характером. Версия 0.25.2:
+- Фикс кнопок Premium (восстановлены callback_query)
+- Фикс выключения голосового режима
+- Анализ картинок (фото) через Groq Vision
 - Мужской голос через edge-tts
-- Голосовой ввод (STT через Groq Whisper)
 - Ультра-токсичный режим
 """
 import os
@@ -74,7 +75,7 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 groq_client = Groq(api_key=GROQ_API_KEY)
 GROQ_MODEL = "openai/gpt-oss-120b"
-VISION_MODEL = "qwen/qwen3.8-27b"  # Модель для картинок
+VISION_MODEL = "qwen/qwen3.8-27b"
 WHISPER_MODEL = "whisper-large-v3-turbo"
 
 dialogue_memory = defaultdict(list)
@@ -212,12 +213,9 @@ def encode_image(image_path: str) -> str:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 def analyze_image_with_groq(image_path: str, prompt: str, mode: str) -> str:
-    """Анализ картинки через Groq Vision."""
     try:
         base64_image = encode_image(image_path)
-        # Добавляем системный промпт характера в запрос к vision-модели
         sys_prompt = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["funny"])
-        
         completion = groq_client.chat.completions.create(
             model=VISION_MODEL,
             messages=[
@@ -230,8 +228,7 @@ def analyze_image_with_groq(image_path: str, prompt: str, mode: str) -> str:
                     ]
                 }
             ],
-            temperature=0.9,
-            max_tokens=500,
+            temperature=0.9, max_tokens=500,
         )
         return completion.choices[0].message.content.strip()
     except Exception as e:
@@ -316,7 +313,7 @@ CANCEL_PATTERN = re.compile(r"^(отмени|убери|удали|забудь|
 STATS_PATTERN = re.compile(r"(статистик|стата|стату|мой прогресс|моя стат|сколько я забил|сколько забил|мои задачи|мою стату)", re.IGNORECASE)
 INSULT_DEV_PATTERN = re.compile(r"(разраб|разработчик|создатель|автор|творец)\s+(лох|дурак|тупой|идиот|дебил|козел|мудак|говно|хуй|пидор|чмо)|(лох|дурак|тупой)\s+(разраб|разработчик|создатель|автор)", re.IGNORECASE)
 VOICE_ON_PATTERN = re.compile(r"(общайся|говори|отвечай|пиши|переходи на)\s+(голосом|голосовыми|голосовухами|голосовое|аудио)", re.IGNORECASE)
-VOICE_OFF_PATTERN = re.compile(r"(хватит|хорош|стоп|перестань|закончи|отключи)\s+(голосом|голосовые|голосовых|голосовухи|аудио|базарить)", re.IGNORECASE)
+VOICE_OFF_PATTERN = re.compile(r"(хватит|хорош|стоп|перестань|закончи|отключи|выруби)\s+(голосом|голосовые|голосовых|голосовухи|аудио|базарить)", re.IGNORECASE)
 
 def parse_simple_time(amount, unit):
     unit = unit.lower()
@@ -443,29 +440,24 @@ async def on_photo(message: Message):
     uid = message.from_user.id
     await update_last_active(uid)
     
-    # Проверка лимита
     if not await cached_premium(uid):
         limits = await get_limits(uid)
         if limits["photo_requests"] >= limits["photo_limit"]:
             await message.answer(f"🛑 *Лимит фото на сегодня ({limits['photo_limit']} шт).*\n\nПригласи друга (/invite) или Premium ⤵", reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
             return
 
-    # Скачиваем фото (берем последний размер, обычно самый большой)
     file_id = message.photo[-1].file_id
     file = await bot.get_file(file_id)
     file_path = f"/tmp/{uid}_{file_id}.jpg"
     await bot.download_file(file.file_path, destination=file_path)
 
-    # Берем подпись к фото или дефолтный вопрос
     prompt = message.caption if message.caption else "Опиши, что на этой картинке. Если это задача или текст — реши/прочитай."
     
     await increment_photo(uid)
     mode = await cached_mode(uid)
     
-    # Анализ
     answer = analyze_image_with_groq(file_path, prompt, mode)
     
-    # Отправка ответа (голосом или текстом)
     if await get_voice_mode(uid):
         if not await cached_premium(uid):
             limits = await get_limits(uid)
@@ -513,12 +505,6 @@ async def on_voice(message: Message):
 async def on_voice_on(message: Message):
     await set_voice_mode(message.from_user.id, True)
     await message.answer("Ок, теперь буду отвечать голосом. Скажи «хватит», чтобы вернуть текст.")
-
-
-@dp.message(F.text.regexp(VOICE_OFF_PATTERN))
-async def on_voice_off(message: Message):
-    await set_voice_mode(message.from_user.id, False)
-    await message.answer("Ок, вернулся в текстовый режим.")
 
 
 # ---------- Основная логика ----------
@@ -638,6 +624,12 @@ async def handle_msg(message: Message):
     uid = message.from_user.id
     text = message.text.strip()
 
+    # 0. ВЫКЛЮЧЕНИЕ ГОЛОСА (ставим в самый верх, чтобы срабатывало первым)
+    if VOICE_OFF_PATTERN.search(text.lower()):
+        await set_voice_mode(uid, False)
+        await message.answer("Ок, вернулся в текстовый режим. Больше не буду базарить голосом 🤝", reply_markup=chat_keyboard())
+        return
+
     # 1. ЗАЩИТА ОТ КНОПОК
     if text in MODE_BUTTONS:
         await update_last_active(uid)
@@ -689,6 +681,77 @@ async def handle_msg(message: Message):
         return
 
     await process_text_message(message, text)
+
+
+# ---------- CALLBACKS ДЛЯ PREMIUM (ВОССТАНОВЛЕНЫ) ----------
+@dp.callback_query(F.data == "premium_info")
+async def cb_premium_info(callback: CallbackQuery):
+    await callback.message.answer(
+        "💎 *Что даёт Premium:*\n\n"
+        "• ♾ Безлимит запросов к боту\n"
+        "• ♾ Безлимит напоминаний\n"
+        "• ♾ Безлимит голосовых\n"
+        "• ♾ Безлимит фото\n"
+        "• 🚀 Поддержка проекта\n\n"
+        f"Цена: *{PREMIUM_PRICE_STARS} звёзд* в месяц "
+        f"(или *{PREMIUM_PRICE_DISCOUNTED}* со скидкой {REF_DISCOUNT_PERCENT}% за 3+ друзей).",
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "buy_premium")
+async def cb_buy_premium(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if await cached_premium(user_id):
+        await callback.message.answer("💎 У тебя уже активен Premium.")
+        await callback.answer()
+        return
+
+    price = await actual_premium_price(user_id)
+
+    try:
+        await bot.send_invoice(
+            chat_id=user_id,
+            title="Мой Кореш Premium",
+            description=f"Безлимит запросов и напоминаний на {PREMIUM_DAYS} дней",
+            payload=f"premium_{user_id}_{PREMIUM_DAYS}",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label="Premium", amount=price)],
+        )
+    except Exception as e:
+        logging.error("Ошибка send_invoice: %s", e)
+        await callback.message.answer(
+            "❌ Не удалось создать счёт. Возможно, Telegram Stars недоступны для твоего аккаунта."
+        )
+    await callback.answer()
+
+@dp.callback_query(F.data == "enter_promo")
+async def cb_enter_promo(callback: CallbackQuery):
+    awaiting_promo.add(callback.from_user.id)
+    await callback.message.answer(
+        "🎁 *Введи промокод.*\n\n"
+        "Просто отправь его следующим сообщением. Например: `BRO2026`\n\n"
+        "Если передумал — напиши «отмена» 🤝",
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+# ---------- Обработка оплаты Stars ----------
+@dp.pre_checkout_query()
+async def on_pre_checkout(pre_checkout_q: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(message: Message):
+    user_id = message.from_user.id
+    await set_premium(user_id, True, PREMIUM_DAYS)
+    cache_set(user_id, premium=True)
+    await message.answer(
+        f"💎 *Premium активирован!*\n\n"
+        f"Спасибо, бро! Теперь у тебя безлимит на {PREMIUM_DAYS} дней. 🤝",
+        parse_mode="Markdown",
+    )
 
 # ---------- Восстановление задач ----------
 async def restore_tasks():
