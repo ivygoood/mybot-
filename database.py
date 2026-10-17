@@ -1,6 +1,5 @@
 """
 Работа с облачной базой Turso через официальный libsql-клиент.
-Все функции async — внутри оборачивают синхронный клиент через asyncio.to_thread.
 """
 import os
 import asyncio
@@ -21,6 +20,8 @@ REF_DISCOUNT_PERCENT = 30
 
 FREE_CHAT_LIMIT = 10
 FREE_REMINDER_LIMIT = 2
+FREE_VOICE_IN = 1
+FREE_VOICE_OUT = 2
 
 
 def _connect():
@@ -39,7 +40,8 @@ def _sync_init_db():
         user_id INTEGER PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'funny',
         premium INTEGER NOT NULL DEFAULT 0, premium_until TEXT, last_active TEXT,
         bonus_requests INTEGER NOT NULL DEFAULT 0, ref_count INTEGER NOT NULL DEFAULT 0,
-        referred_by INTEGER, started_once INTEGER NOT NULL DEFAULT 0)""")
+        referred_by INTEGER, started_once INTEGER NOT NULL DEFAULT 0,
+        voice_mode INTEGER NOT NULL DEFAULT 0)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, text TEXT NOT NULL,
         remind_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending')""")
@@ -51,8 +53,18 @@ def _sync_init_db():
         PRIMARY KEY (code, user_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS user_limits (
         user_id INTEGER NOT NULL, date TEXT NOT NULL, chat_requests INTEGER NOT NULL DEFAULT 0,
-        reminders_created INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, date))""")
+        reminders_created INTEGER NOT NULL DEFAULT 0, voice_in INTEGER NOT NULL DEFAULT 0,
+        voice_out INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, date))""")
     conn.commit()
+
+    # Миграция для старых баз
+    for col, tbl, typ in [("voice_mode", "users", "INTEGER DEFAULT 0"), ("voice_in", "user_limits", "INTEGER DEFAULT 0"), ("voice_out", "user_limits", "INTEGER DEFAULT 0")]:
+        try:
+            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
+            conn.commit()
+        except Exception:
+            pass
+
     conn.close()
 
 
@@ -67,6 +79,20 @@ def _sync_set_mode(user_id, mode):
     conn = _connect(); cur = conn.cursor()
     cur.execute("""INSERT INTO users (user_id, mode) VALUES (?, ?)
         ON CONFLICT(user_id) DO UPDATE SET mode = excluded.mode""", (user_id, mode))
+    conn.commit(); conn.close()
+
+
+def _sync_get_voice_mode(user_id):
+    conn = _connect(); cur = conn.cursor()
+    cur.execute("SELECT voice_mode FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone(); conn.close()
+    return bool(row[0]) if row else False
+
+
+def _sync_set_voice_mode(user_id, active):
+    conn = _connect(); cur = conn.cursor()
+    cur.execute("""INSERT INTO users (user_id, voice_mode) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET voice_mode = excluded.voice_mode""", (user_id, 1 if active else 0))
     conn.commit(); conn.close()
 
 
@@ -94,16 +120,20 @@ def _sync_set_premium(user_id, active, days=30):
 
 def _sync_get_limits(user_id):
     conn = _connect(); cur = conn.cursor()
-    cur.execute("SELECT chat_requests, reminders_created FROM user_limits WHERE user_id = ? AND date = ?",
+    cur.execute("SELECT chat_requests, reminders_created, voice_in, voice_out FROM user_limits WHERE user_id = ? AND date = ?",
         (user_id, _today()))
     row = cur.fetchone()
     cur.execute("SELECT bonus_requests FROM users WHERE user_id = ?", (user_id,))
     b = cur.fetchone(); conn.close()
     used_chat = row[0] if row else 0
     used_rem = row[1] if row else 0
+    v_in = row[2] if row else 0
+    v_out = row[3] if row else 0
     bonus = b[0] if b else 0
     return {"chat_requests": used_chat, "reminders_created": used_rem, "bonus_requests": bonus,
-            "chat_limit": FREE_CHAT_LIMIT + bonus, "reminder_limit": FREE_REMINDER_LIMIT}
+            "voice_in": v_in, "voice_out": v_out,
+            "chat_limit": FREE_CHAT_LIMIT + bonus, "reminder_limit": FREE_REMINDER_LIMIT,
+            "voice_in_limit": FREE_VOICE_IN, "voice_out_limit": FREE_VOICE_OUT}
 
 
 def _sync_inc_chat(user_id):
@@ -121,6 +151,24 @@ def _sync_inc_reminders(user_id):
         ON CONFLICT(user_id, date) DO UPDATE SET reminders_created = reminders_created + 1""", (user_id, _today()))
     conn.commit()
     cur.execute("SELECT reminders_created FROM user_limits WHERE user_id = ? AND date = ?", (user_id, _today()))
+    v = cur.fetchone()[0]; conn.close(); return v
+
+
+def _sync_inc_voice_in(user_id):
+    conn = _connect(); cur = conn.cursor()
+    cur.execute("""INSERT INTO user_limits (user_id, date, voice_in) VALUES (?, ?, 1)
+        ON CONFLICT(user_id, date) DO UPDATE SET voice_in = voice_in + 1""", (user_id, _today()))
+    conn.commit()
+    cur.execute("SELECT voice_in FROM user_limits WHERE user_id = ? AND date = ?", (user_id, _today()))
+    v = cur.fetchone()[0]; conn.close(); return v
+
+
+def _sync_inc_voice_out(user_id):
+    conn = _connect(); cur = conn.cursor()
+    cur.execute("""INSERT INTO user_limits (user_id, date, voice_out) VALUES (?, ?, 1)
+        ON CONFLICT(user_id, date) DO UPDATE SET voice_out = voice_out + 1""", (user_id, _today()))
+    conn.commit()
+    cur.execute("SELECT voice_out FROM user_limits WHERE user_id = ? AND date = ?", (user_id, _today()))
     v = cur.fetchone()[0]; conn.close(); return v
 
 
@@ -275,11 +323,15 @@ def _sync_user_stats(user_id):
 async def init_db(): await asyncio.to_thread(_sync_init_db)
 async def get_user_mode(uid): return await asyncio.to_thread(_sync_get_mode, uid)
 async def set_user_mode(uid, m): await asyncio.to_thread(_sync_set_mode, uid, m)
+async def get_voice_mode(uid): return await asyncio.to_thread(_sync_get_voice_mode, uid)
+async def set_voice_mode(uid, a): await asyncio.to_thread(_sync_set_voice_mode, uid, a)
 async def is_premium(uid): return await asyncio.to_thread(_sync_is_premium, uid)
 async def set_premium(uid, a, d=30): await asyncio.to_thread(_sync_set_premium, uid, a, d)
 async def get_limits(uid): return await asyncio.to_thread(_sync_get_limits, uid)
 async def increment_chat_requests(uid): return await asyncio.to_thread(_sync_inc_chat, uid)
 async def increment_reminders(uid): return await asyncio.to_thread(_sync_inc_reminders, uid)
+async def increment_voice_in(uid): return await asyncio.to_thread(_sync_inc_voice_in, uid)
+async def increment_voice_out(uid): return await asyncio.to_thread(_sync_inc_voice_out, uid)
 async def add_bonus_requests(uid, a): await asyncio.to_thread(_sync_add_bonus, uid, a)
 async def update_last_active(uid): await asyncio.to_thread(_sync_update_active, uid)
 async def get_total_users(): return await asyncio.to_thread(_sync_total_users)
