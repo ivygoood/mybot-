@@ -1,7 +1,6 @@
 """
 Работа с облачной базой Turso через официальный libsql-клиент.
-Все функции async — внутри оборачивают синхронный клиент через asyncio.to_thread,
-чтобы не блокировать event loop aiogram.
+Все функции async — внутри оборачивают синхронный клиент через asyncio.to_thread.
 """
 import os
 import asyncio
@@ -25,15 +24,13 @@ FREE_REMINDER_LIMIT = 2
 
 
 def _connect():
-    """Синхронное подключение к Turso."""
     return libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
-
 
 def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-# ==================== SYNC-ФУНКЦИИ (внутренние) ====================
+# ==================== SYNC-ФУНКЦИИ ====================
 
 def _sync_init_db():
     conn = _connect()
@@ -62,8 +59,7 @@ def _sync_init_db():
 def _sync_get_mode(user_id):
     conn = _connect(); cur = conn.cursor()
     cur.execute("SELECT mode FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
+    row = cur.fetchone(); conn.close()
     return row[0] if row else "funny"
 
 
@@ -77,13 +73,10 @@ def _sync_set_mode(user_id, mode):
 def _sync_is_premium(user_id):
     conn = _connect(); cur = conn.cursor()
     cur.execute("SELECT premium, premium_until FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return False
+    row = cur.fetchone(); conn.close()
+    if not row: return False
     premium, until = row
-    if not premium:
-        return False
+    if not premium: return False
     if until and datetime.fromisoformat(until) < datetime.now():
         _sync_set_premium(user_id, False)
         return False
@@ -105,8 +98,7 @@ def _sync_get_limits(user_id):
         (user_id, _today()))
     row = cur.fetchone()
     cur.execute("SELECT bonus_requests FROM users WHERE user_id = ?", (user_id,))
-    b = cur.fetchone()
-    conn.close()
+    b = cur.fetchone(); conn.close()
     used_chat = row[0] if row else 0
     used_rem = row[1] if row else 0
     bonus = b[0] if b else 0
@@ -120,9 +112,7 @@ def _sync_inc_chat(user_id):
         ON CONFLICT(user_id, date) DO UPDATE SET chat_requests = chat_requests + 1""", (user_id, _today()))
     conn.commit()
     cur.execute("SELECT chat_requests FROM user_limits WHERE user_id = ? AND date = ?", (user_id, _today()))
-    v = cur.fetchone()[0]
-    conn.close()
-    return v
+    v = cur.fetchone()[0]; conn.close(); return v
 
 
 def _sync_inc_reminders(user_id):
@@ -131,9 +121,7 @@ def _sync_inc_reminders(user_id):
         ON CONFLICT(user_id, date) DO UPDATE SET reminders_created = reminders_created + 1""", (user_id, _today()))
     conn.commit()
     cur.execute("SELECT reminders_created FROM user_limits WHERE user_id = ? AND date = ?", (user_id, _today()))
-    v = cur.fetchone()[0]
-    conn.close()
-    return v
+    v = cur.fetchone()[0]; conn.close(); return v
 
 
 def _sync_add_bonus(user_id, amount):
@@ -145,8 +133,7 @@ def _sync_add_bonus(user_id, amount):
 
 def _sync_update_active(user_id):
     conn = _connect(); cur = conn.cursor()
-    cur.execute("UPDATE users SET last_active = ? WHERE user_id = ?",
-        (datetime.now().isoformat(), user_id))
+    cur.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (datetime.now().isoformat(), user_id))
     if cur.rowcount == 0:
         cur.execute("INSERT INTO users (user_id, mode, premium, last_active) VALUES (?, 'funny', 0, ?)",
             (user_id, datetime.now().isoformat()))
@@ -155,16 +142,13 @@ def _sync_update_active(user_id):
 
 def _sync_total_users():
     conn = _connect(); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    v = cur.fetchone()[0]; conn.close(); return v
-
+    cur.execute("SELECT COUNT(*) FROM users"); v = cur.fetchone()[0]; conn.close(); return v
 
 def _sync_active_users(hours):
     conn = _connect(); cur = conn.cursor()
     threshold = (datetime.now() - timedelta(hours=hours)).isoformat()
     cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (threshold,))
     v = cur.fetchone()[0]; conn.close(); return v
-
 
 def _sync_premium_users():
     conn = _connect(); cur = conn.cursor()
@@ -193,10 +177,8 @@ def _sync_register_referral(new_user_id, referrer_id):
     conn = _connect(); cur = conn.cursor()
     cur.execute("SELECT started_once, referred_by FROM users WHERE user_id = ?", (new_user_id,))
     row = cur.fetchone()
-    if row and row[0]:
-        conn.close(); return False, "Этот пользователь уже пользуется ботом."
-    if row and row[1]:
-        conn.close(); return False, "Этот пользователь уже был приглашён."
+    if row and row[0]: conn.close(); return False, "Этот пользователь уже пользуется ботом."
+    if row and row[1]: conn.close(); return False, "Этот пользователь уже был приглашён."
     cur.execute("""INSERT INTO users (user_id, referred_by, started_once) VALUES (?, ?, 0)
         ON CONFLICT(user_id) DO UPDATE SET referred_by = excluded.referred_by""", (new_user_id, referrer_id))
     cur.execute("""INSERT INTO users (user_id, bonus_requests, ref_count) VALUES (?, ?, 1)
@@ -210,8 +192,7 @@ def _sync_ref_stats(user_id):
     conn = _connect(); cur = conn.cursor()
     cur.execute("SELECT ref_count, bonus_requests FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone(); conn.close()
-    if not row:
-        return {"ref_count": 0, "bonus_requests": 0}
+    if not row: return {"ref_count": 0, "bonus_requests": 0}
     return {"ref_count": row[0] or 0, "bonus_requests": row[1] or 0}
 
 
@@ -227,14 +208,11 @@ def _sync_redeem_promo(user_id, code):
     conn = _connect(); cur = conn.cursor()
     cur.execute("SELECT days, uses_left FROM promocodes WHERE code = ?", (code,))
     row = cur.fetchone()
-    if not row:
-        conn.close(); return False, "Такого промокода не существует."
+    if not row: conn.close(); return False, "Такого промокода не существует."
     days, uses_left = row
-    if uses_left <= 0:
-        conn.close(); return False, "Этот промокод уже исчерпан."
+    if uses_left <= 0: conn.close(); return False, "Этот промокод уже исчерпан."
     cur.execute("SELECT 1 FROM promocode_redemptions WHERE code = ? AND user_id = ?", (code, user_id))
-    if cur.fetchone():
-        conn.close(); return False, "Ты уже использовал этот промокод."
+    if cur.fetchone(): conn.close(); return False, "Ты уже использовал этот промокод."
     cur.execute("UPDATE promocodes SET uses_left = uses_left - 1 WHERE code = ?", (code,))
     cur.execute("INSERT INTO promocode_redemptions (code, user_id, redeemed_at) VALUES (?, ?, ?)",
         (code, user_id, datetime.now().isoformat()))
@@ -262,10 +240,12 @@ def _sync_pending_tasks(user_id=None):
     return [{"id": r[0], "user_id": r[1], "text": r[2], "remind_at": r[3]} for r in rows]
 
 
-def _sync_update_task_time(task_id, remind_at):
+def _sync_get_task(task_id):
     conn = _connect(); cur = conn.cursor()
-    cur.execute("UPDATE tasks SET remind_at = ? WHERE id = ?", (remind_at.isoformat(), task_id))
-    conn.commit(); conn.close()
+    cur.execute("SELECT id, user_id, text, remind_at, status FROM tasks WHERE id = ?", (task_id,))
+    row = cur.fetchone(); conn.close()
+    if not row: return None
+    return {"id": row[0], "user_id": row[1], "text": row[2], "remind_at": row[3], "status": row[4]}
 
 
 def _sync_mark_status(task_id, status):
@@ -277,9 +257,7 @@ def _sync_mark_status(task_id, status):
 def _sync_cancel_all(user_id):
     conn = _connect(); cur = conn.cursor()
     cur.execute("UPDATE tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'", (user_id,))
-    c = cur.rowcount
-    conn.commit(); conn.close()
-    return c
+    c = cur.rowcount; conn.commit(); conn.close(); return c
 
 
 def _sync_user_stats(user_id):
@@ -288,8 +266,7 @@ def _sync_user_stats(user_id):
     rows = cur.fetchall(); conn.close()
     stats = {"done": 0, "failed": 0, "cancelled": 0, "pending": 0}
     for status, count in rows:
-        if status in stats:
-            stats[status] = count
+        if status in stats: stats[status] = count
     return stats
 
 
@@ -319,18 +296,7 @@ async def create_promocode(c, d, u): await asyncio.to_thread(_sync_create_promo,
 async def redeem_promocode(uid, c): return await asyncio.to_thread(_sync_redeem_promo, uid, c)
 async def add_task(uid, t, r): return await asyncio.to_thread(_sync_add_task, uid, t, r)
 async def get_pending_tasks(uid=None): return await asyncio.to_thread(_sync_pending_tasks, uid)
-async def update_task_remind_at(tid, r): await asyncio.to_thread(_sync_update_task_time, tid, r)
+async def get_task_by_id(tid): return await asyncio.to_thread(_sync_get_task, tid)
 async def mark_task_status(tid, s): await asyncio.to_thread(_sync_mark_status, tid, s)
 async def cancel_all_user_tasks(uid): return await asyncio.to_thread(_sync_cancel_all, uid)
 async def get_user_stats(uid): return await asyncio.to_thread(_sync_user_stats, uid)
-
-
-# ---------- Заглушки для совместимости ----------
-
-async def get_task_by_id(task_id):
-    """Не используется в текущей версии бота, но оставлено для совместимости."""
-    return None
-
-
-FREE_CHAT_LIMIT = 10
-FREE_REMINDER_LIMIT = 2
