@@ -1,13 +1,14 @@
 """
-Бот-напоминалка с характером. Версия 0.24.2:
-- Фикс кнопок (теперь не улетают в LLM)
-- Мужской голос через edge-tts (патч 403 ошибки)
+Бот-напоминалка с характером. Версия 0.25:
+- Анализ картинок (фото) через Groq Vision (Qwen)
+- Мужской голос через edge-tts
 - Голосовой ввод (STT через Groq Whisper)
 - Ультра-токсичный режим
 """
 import os
 import re
 import io
+import base64
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -46,8 +47,8 @@ from database import (
     init_db, get_user_mode, set_user_mode, get_voice_mode, set_voice_mode,
     add_task, get_pending_tasks, get_task_by_id, mark_task_status, cancel_all_user_tasks,
     get_user_stats, is_premium, set_premium, get_limits, increment_chat_requests,
-    increment_reminders, increment_voice_in, increment_voice_out, add_bonus_requests,
-    FREE_CHAT_LIMIT, FREE_REMINDER_LIMIT, FREE_VOICE_IN, FREE_VOICE_OUT,
+    increment_reminders, increment_voice_in, increment_voice_out, increment_photo, add_bonus_requests,
+    FREE_CHAT_LIMIT, FREE_REMINDER_LIMIT, FREE_VOICE_IN, FREE_VOICE_OUT, FREE_PHOTO,
     update_last_active, get_total_users, get_active_users, get_premium_users,
     create_promocode, redeem_promocode, is_new_user, mark_user_started,
     register_referral, get_referral_stats, has_referral_discount,
@@ -73,6 +74,7 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 groq_client = Groq(api_key=GROQ_API_KEY)
 GROQ_MODEL = "openai/gpt-oss-120b"
+VISION_MODEL = "qwen/qwen3.8-27b"  # Модель для картинок
 WHISPER_MODEL = "whisper-large-v3-turbo"
 
 dialogue_memory = defaultdict(list)
@@ -131,7 +133,7 @@ COMMON_RULES = (
     "ВАЖНО О ТЕБЕ:\n"
     "• Тебя зовут «Мой Кореш». Ты — Telegram-бот.\n"
     "• Ты НЕ ChatGPT, НЕ Groq, НЕ Gemini, НЕ продукт OpenAI. Никогда не упоминай эти названия.\n"
-    "• Если спрашивают про подписку, тарифы, лимиты: «Есть бесплатный тариф: 10 запросов, 2 напоминания, 1 голосовое. Premium — 45 звёзд в месяц».\n"
+    "• Если спрашивают про подписку, тарифы, лимиты: «Есть бесплатный тариф: 10 запросов, 2 напоминания, 1 голосовое, 2 фото. Premium — 45 звёзд в месяц».\n"
     "• НЕ выдумывай числа, статистику, факты.\n"
     "• НЕ пиши фразы типа «Сейчас поставлю напоминание» или «Напомню через 5 минут». ЭТО ДЕЛАЕТ КОД. Если код не сработал — скажи «Не понял время, напиши нормально».\n"
     "• Про бессмысленные напоминания отвечай с юмором: «Не в моих силах отложить такое, ты сам решай».\n"
@@ -204,6 +206,37 @@ def classify_answer_llm(text: str) -> str:
         if "FAIL" in res: return "fail"
         return "neutral"
     except: return "neutral"
+
+def encode_image(image_path: str) -> str:
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+def analyze_image_with_groq(image_path: str, prompt: str, mode: str) -> str:
+    """Анализ картинки через Groq Vision."""
+    try:
+        base64_image = encode_image(image_path)
+        # Добавляем системный промпт характера в запрос к vision-модели
+        sys_prompt = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["funny"])
+        
+        completion = groq_client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    ]
+                }
+            ],
+            temperature=0.9,
+            max_tokens=500,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error("Vision error: %s", e)
+        return "Не могу разобрать, что на фото. Попробуй ещё раз."
 
 # ---------- Утилиты для голоса ----------
 def transcribe_voice(file_path: str) -> str:
@@ -318,14 +351,14 @@ async def cmd_start(message: Message, command: CommandObject):
 
     current, premium = await cached_mode(uid), await cached_premium(uid)
     limits = await get_limits(uid)
-    limit_line = "💎 Premium — безлимит" if premium else f"🆓 Лимит: {limits['chat_requests']}/{limits['chat_limit']} запросов, {limits['reminders_created']}/{limits['reminder_limit']} напоминаний, {limits['voice_in']}/{limits['voice_in_limit']} голосовых"
+    limit_line = "💎 Premium — безлимит" if premium else f"🆓 Лимит: {limits['chat_requests']}/{limits['chat_limit']} запросов, {limits['reminders_created']}/{limits['reminder_limit']} напоминаний, {limits['voice_in']}/{limits['voice_in_limit']} голосовых, {limits['photo_requests']}/{limits['photo_limit']} фото"
 
-    await message.answer(f"👋 *Здорово, бро! Я твой кореш.*\n\nЧто я умею:\n• ⏰ *Напоминать* — «напомни через 30 минут»\n• 🎙️ *Слушать голосовые* — просто запиши\n• 🗣️ *Отвечать голосом* — скажи «общайся голосом»\n• 📊 *Статистика* — «статистика»\n• 💬 *Болтать* — просто пиши\n\nРежим: *{current}*\n{limit_line}", reply_markup=chat_keyboard(), parse_mode="Markdown")
+    await message.answer(f"👋 *Здорово, бро! Я твой кореш.*\n\nЧто я умею:\n• ⏰ *Напоминать* — «напомни через 30 минут»\n• 🎙️ *Слушать голосовые* — просто запиши\n• 🗣️ *Отвечать голосом* — скажи «общайся голосом»\n• 🖼️ *Понимать фото* — скинь картинку и спроси\n• 📊 *Статистика* — «статистика»\n• 💬 *Болтать* — просто пиши\n\nРежим: *{current}*\n{limit_line}", reply_markup=chat_keyboard(), parse_mode="Markdown")
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await update_last_active(message.from_user.id)
-    await message.answer("🤝 *Что я умею:*\n\n⏰ *Напоминания* — «напомни через 5 минут»\n\n🎙️ *Голосовой ввод* — отправь голосовое, я расшифрую.\n\n🗣️ *Голосовые ответы* — скажи «общайся голосом», чтобы я отвечал аудио.\n\n📊 *Статистика* — «статистика»\n\n🎁 *Пригласить друга* — /invite\n\n💎 *Подписка* — /premium", parse_mode="Markdown")
+    await message.answer("🤝 *Что я умею:*\n\n⏰ *Напоминания* — «напомни через 5 минут»\n\n🎙️ *Голосовой ввод* — отправь голосовое, я расшифрую.\n\n🗣️ *Голосовые ответы* — скажи «общайся голосом».\n\n🖼️ *Анализ фото* — отправь картинку и напиши вопрос к ней.\n\n📊 *Статистика* — «статистика»\n\n🎁 *Пригласить друга* — /invite\n\n💎 *Подписка* — /premium", parse_mode="Markdown")
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
@@ -333,7 +366,7 @@ async def cmd_settings(message: Message):
     await update_last_active(uid)
     current, premium = await cached_mode(uid), await cached_premium(uid)
     limits = await get_limits(uid)
-    limit_line = "💎 Premium — *безлимит*" if premium else f"🆓 Запросы: *{limits['chat_requests']}/{limits['chat_limit']}*\n• Напоминания: *{limits['reminders_created']}/{limits['reminder_limit']}*\n• Голосовые: *{limits['voice_in']}/{limits['voice_in_limit']}*"
+    limit_line = "💎 Premium — *безлимит*" if premium else f"🆓 Запросы: *{limits['chat_requests']}/{limits['chat_limit']}*\n• Напоминания: *{limits['reminders_created']}/{limits['reminder_limit']}*\n• Голосовые: *{limits['voice_in']}/{limits['voice_in_limit']}*\n• Фото: *{limits['photo_requests']}/{limits['photo_limit']}*"
     if not premium and limits["bonus_requests"] > 0: limit_line += f"\n🎁 Бонус: *+{limits['bonus_requests']}*"
     await message.answer(f"⚙️ *Настройки*\n\n🎭 Режим: *{current}*\n\n{limit_line}\n\nВыбери режим снизу.", reply_markup=settings_keyboard(), parse_mode="Markdown")
 
@@ -348,7 +381,7 @@ async def cmd_premium(message: Message):
     if await has_referral_discount(uid):
         stats = await get_referral_stats(uid)
         price_line += f"\n🎉 Скидка *{REF_DISCOUNT_PERCENT}%* за {stats['ref_count']} друзей!"
-    await message.answer(f"💎 *Premium*\n\n{price_line}\n\nЧто даёт:\n• ♾ Безлимит запросов\n• ♾ Безлимит напоминаний\n• ♾ Безлимит голосовых\n• 🚀 Поддержка", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"⭐ Купить ({price} звёзд)", callback_data="buy_premium")],[InlineKeyboardButton(text="🎁 Промокод", callback_data="enter_promo")]]), parse_mode="Markdown")
+    await message.answer(f"💎 *Premium*\n\n{price_line}\n\nЧто даёт:\n• ♾ Безлимит запросов\n• ♾ Безлимит напоминаний\n• ♾ Безлимит голосовых\n• ♾ Безлимит фото\n• 🚀 Поддержка", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"⭐ Купить ({price} звёзд)", callback_data="buy_premium")],[InlineKeyboardButton(text="🎁 Промокод", callback_data="enter_promo")]]), parse_mode="Markdown")
 
 @dp.message(Command("paysupport"))
 async def cmd_paysupport(message: Message):
@@ -403,6 +436,51 @@ async def on_insult_dev(message: Message):
     elif mode == "funny": ans = "Э, полегче, чемпион. Ты вообще кто такой, чтобы про моего создателя так говорить? Я его знаю, он нормальный мужик. Так что закрой рот и пользуйся ботом."
     else: ans = "Оскорбления в адрес разработчика неуместны. Если есть претензия — пиши @ivygood. Если хочешь хамить — бот не для тебя."
     await message.answer(ans)
+
+# ---------- Фото ----------
+@dp.message(F.photo)
+async def on_photo(message: Message):
+    uid = message.from_user.id
+    await update_last_active(uid)
+    
+    # Проверка лимита
+    if not await cached_premium(uid):
+        limits = await get_limits(uid)
+        if limits["photo_requests"] >= limits["photo_limit"]:
+            await message.answer(f"🛑 *Лимит фото на сегодня ({limits['photo_limit']} шт).*\n\nПригласи друга (/invite) или Premium ⤵", reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
+            return
+
+    # Скачиваем фото (берем последний размер, обычно самый большой)
+    file_id = message.photo[-1].file_id
+    file = await bot.get_file(file_id)
+    file_path = f"/tmp/{uid}_{file_id}.jpg"
+    await bot.download_file(file.file_path, destination=file_path)
+
+    # Берем подпись к фото или дефолтный вопрос
+    prompt = message.caption if message.caption else "Опиши, что на этой картинке. Если это задача или текст — реши/прочитай."
+    
+    await increment_photo(uid)
+    mode = await cached_mode(uid)
+    
+    # Анализ
+    answer = analyze_image_with_groq(file_path, prompt, mode)
+    
+    # Отправка ответа (голосом или текстом)
+    if await get_voice_mode(uid):
+        if not await cached_premium(uid):
+            limits = await get_limits(uid)
+            if limits["voice_out"] >= limits["voice_out_limit"]:
+                await message.answer(answer)
+                await message.answer(f"🛑 Лимит голосовых ответов на сегодня. Продолжаю текстом. Premium — безлимит ⤵", reply_markup=premium_menu_keyboard(), parse_mode="Markdown")
+                return
+        await increment_voice_out(uid)
+        audio_fp = await text_to_speech(answer)
+        if audio_fp:
+            await message.answer_voice(BufferedInputFile(audio_fp.read(), filename="voice.mp3"))
+        else:
+            await message.answer(answer)
+    else:
+        await message.answer(answer)
 
 # ---------- Голосовые ----------
 @dp.message(F.voice)
@@ -560,7 +638,7 @@ async def handle_msg(message: Message):
     uid = message.from_user.id
     text = message.text.strip()
 
-    # 1. ЗАЩИТА ОТ КНОПОК (теперь они не улетают в LLM)
+    # 1. ЗАЩИТА ОТ КНОПОК
     if text in MODE_BUTTONS:
         await update_last_active(uid)
         mode = MODE_BUTTONS[text]
