@@ -22,6 +22,7 @@ FREE_CHAT_LIMIT = 10
 FREE_REMINDER_LIMIT = 2
 FREE_VOICE_IN = 1
 FREE_VOICE_OUT = 2
+FREE_PHOTO = 2  # Новый лимит для картинок
 
 
 def _connect():
@@ -54,11 +55,17 @@ def _sync_init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS user_limits (
         user_id INTEGER NOT NULL, date TEXT NOT NULL, chat_requests INTEGER NOT NULL DEFAULT 0,
         reminders_created INTEGER NOT NULL DEFAULT 0, voice_in INTEGER NOT NULL DEFAULT 0,
-        voice_out INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, date))""")
+        voice_out INTEGER NOT NULL DEFAULT 0, photo_requests INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, date))""")
     conn.commit()
 
     # Миграция для старых баз
-    for col, tbl, typ in [("voice_mode", "users", "INTEGER DEFAULT 0"), ("voice_in", "user_limits", "INTEGER DEFAULT 0"), ("voice_out", "user_limits", "INTEGER DEFAULT 0")]:
+    for col, tbl, typ in [
+        ("voice_mode", "users", "INTEGER DEFAULT 0"),
+        ("voice_in", "user_limits", "INTEGER DEFAULT 0"),
+        ("voice_out", "user_limits", "INTEGER DEFAULT 0"),
+        ("photo_requests", "user_limits", "INTEGER DEFAULT 0")
+    ]:
         try:
             cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
             conn.commit()
@@ -120,7 +127,7 @@ def _sync_set_premium(user_id, active, days=30):
 
 def _sync_get_limits(user_id):
     conn = _connect(); cur = conn.cursor()
-    cur.execute("SELECT chat_requests, reminders_created, voice_in, voice_out FROM user_limits WHERE user_id = ? AND date = ?",
+    cur.execute("SELECT chat_requests, reminders_created, voice_in, voice_out, photo_requests FROM user_limits WHERE user_id = ? AND date = ?",
         (user_id, _today()))
     row = cur.fetchone()
     cur.execute("SELECT bonus_requests FROM users WHERE user_id = ?", (user_id,))
@@ -129,11 +136,13 @@ def _sync_get_limits(user_id):
     used_rem = row[1] if row else 0
     v_in = row[2] if row else 0
     v_out = row[3] if row else 0
+    p_req = row[4] if row else 0
     bonus = b[0] if b else 0
     return {"chat_requests": used_chat, "reminders_created": used_rem, "bonus_requests": bonus,
-            "voice_in": v_in, "voice_out": v_out,
+            "voice_in": v_in, "voice_out": v_out, "photo_requests": p_req,
             "chat_limit": FREE_CHAT_LIMIT + bonus, "reminder_limit": FREE_REMINDER_LIMIT,
-            "voice_in_limit": FREE_VOICE_IN, "voice_out_limit": FREE_VOICE_OUT}
+            "voice_in_limit": FREE_VOICE_IN, "voice_out_limit": FREE_VOICE_OUT,
+            "photo_limit": FREE_PHOTO}
 
 
 def _sync_inc_chat(user_id):
@@ -169,6 +178,15 @@ def _sync_inc_voice_out(user_id):
         ON CONFLICT(user_id, date) DO UPDATE SET voice_out = voice_out + 1""", (user_id, _today()))
     conn.commit()
     cur.execute("SELECT voice_out FROM user_limits WHERE user_id = ? AND date = ?", (user_id, _today()))
+    v = cur.fetchone()[0]; conn.close(); return v
+
+
+def _sync_inc_photo(user_id):
+    conn = _connect(); cur = conn.cursor()
+    cur.execute("""INSERT INTO user_limits (user_id, date, photo_requests) VALUES (?, ?, 1)
+        ON CONFLICT(user_id, date) DO UPDATE SET photo_requests = photo_requests + 1""", (user_id, _today()))
+    conn.commit()
+    cur.execute("SELECT photo_requests FROM user_limits WHERE user_id = ? AND date = ?", (user_id, _today()))
     v = cur.fetchone()[0]; conn.close(); return v
 
 
@@ -332,6 +350,7 @@ async def increment_chat_requests(uid): return await asyncio.to_thread(_sync_inc
 async def increment_reminders(uid): return await asyncio.to_thread(_sync_inc_reminders, uid)
 async def increment_voice_in(uid): return await asyncio.to_thread(_sync_inc_voice_in, uid)
 async def increment_voice_out(uid): return await asyncio.to_thread(_sync_inc_voice_out, uid)
+async def increment_photo(uid): return await asyncio.to_thread(_sync_inc_photo, uid)
 async def add_bonus_requests(uid, a): await asyncio.to_thread(_sync_add_bonus, uid, a)
 async def update_last_active(uid): await asyncio.to_thread(_sync_update_active, uid)
 async def get_total_users(): return await asyncio.to_thread(_sync_total_users)
