@@ -18,6 +18,17 @@ from urllib.parse import quote
 
 import dateparser
 import edge_tts
+import edge_tts.constants
+import edge_tts.communicate
+
+# ПРИНУДИТЕЛЬНЫЙ ФИКС 403 ОШИБКИ (Microsoft сменил сервер в окт. 2026)
+NEW_WSS_URL = (
+    "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+    f"?Ocp-Apim-Subscription-Key={edge_tts.constants.TRUSTED_CLIENT_TOKEN}"
+)
+edge_tts.constants.WSS_URL = NEW_WSS_URL
+edge_tts.communicate.WSS_URL = NEW_WSS_URL
+# -----------------------------------------------------------------
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
