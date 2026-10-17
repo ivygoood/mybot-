@@ -1,9 +1,9 @@
 """
-Бот-напоминалка с характером. Версия 0.25.2:
-- Фикс кнопок Premium (восстановлены callback_query)
-- Фикс выключения голосового режима
+Бот-напоминалка с характером. Версия 0.25.3:
+- Фикс: голосовые напоминания теперь работают через парсер
+- Фикс: расширены триггеры выключения голоса ("пиши текстом", "хватит болтать" и т.д.)
+- Фикс кнопок Premium
 - Анализ картинок (фото) через Groq Vision
-- Мужской голос через edge-tts
 - Ультра-токсичный режим
 """
 import os
@@ -312,8 +312,10 @@ SMART_PATTERN = re.compile(r"(?:напомни|поставь напоминан
 CANCEL_PATTERN = re.compile(r"^(отмени|убери|удали|забудь|сними)\s+(все\s+)?(напоминани[еяй]|задач[уи]|задани[ея])(\s+все)?\.?$", re.IGNORECASE)
 STATS_PATTERN = re.compile(r"(статистик|стата|стату|мой прогресс|моя стат|сколько я забил|сколько забил|мои задачи|мою стату)", re.IGNORECASE)
 INSULT_DEV_PATTERN = re.compile(r"(разраб|разработчик|создатель|автор|творец)\s+(лох|дурак|тупой|идиот|дебил|козел|мудак|говно|хуй|пидор|чмо)|(лох|дурак|тупой)\s+(разраб|разработчик|создатель|автор)", re.IGNORECASE)
-VOICE_ON_PATTERN = re.compile(r"(общайся|говори|отвечай|пиши|переходи на)\s+(голосом|голосовыми|голосовухами|голосовое|аудио)", re.IGNORECASE)
-VOICE_OFF_PATTERN = re.compile(r"(хватит|хорош|стоп|перестань|закончи|отключи|выруби)\s+(голосом|голосовые|голосовых|голосовухи|аудио|базарить)", re.IGNORECASE)
+
+# РАСШИРЕННЫЕ ТРИГГЕРЫ ГОЛОСА
+VOICE_ON_PATTERN = re.compile(r"(общайся|говори|отвечай|пиши|переходи на|включи)\s+(голосом|голосовыми|голосовухами|голосовое|аудио)", re.IGNORECASE)
+VOICE_OFF_PATTERN = re.compile(r"(хватит|хорош|стоп|перестань|закончи|отключи|выруби|пиши|давай|верни)\s+(голосом|голосовые|голосовых|голосовухи|аудио|базарить|текстом|буквами)|(пиши|верни|давай)\s+(текстом|буквами)", re.IGNORECASE)
 
 def parse_simple_time(amount, unit):
     unit = unit.lower()
@@ -498,7 +500,10 @@ async def on_voice(message: Message):
     
     await increment_voice_in(uid)
     await message.answer(f"🎙️ *Ты сказал:* «{text}»", parse_mode="Markdown")
-    await process_text_message(message, text)
+    
+    # ВАЖНО: Сначала прогоняем через парсер напоминаний
+    if not await handle_reminders(message, text):
+        await process_text_message(message, text)
 
 
 @dp.message(F.text.regexp(VOICE_ON_PATTERN))
@@ -624,7 +629,7 @@ async def handle_msg(message: Message):
     uid = message.from_user.id
     text = message.text.strip()
 
-    # 0. ВЫКЛЮЧЕНИЕ ГОЛОСА (ставим в самый верх, чтобы срабатывало первым)
+    # 0. ВЫКЛЮЧЕНИЕ ГОЛОСА (расширенные триггеры)
     if VOICE_OFF_PATTERN.search(text.lower()):
         await set_voice_mode(uid, False)
         await message.answer("Ок, вернулся в текстовый режим. Больше не буду базарить голосом 🤝", reply_markup=chat_keyboard())
@@ -683,7 +688,7 @@ async def handle_msg(message: Message):
     await process_text_message(message, text)
 
 
-# ---------- CALLBACKS ДЛЯ PREMIUM (ВОССТАНОВЛЕНЫ) ----------
+# ---------- CALLBACKS ДЛЯ PREMIUM ----------
 @dp.callback_query(F.data == "premium_info")
 async def cb_premium_info(callback: CallbackQuery):
     await callback.message.answer(
