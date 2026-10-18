@@ -22,7 +22,7 @@ FREE_CHAT_LIMIT = 10
 FREE_REMINDER_LIMIT = 2
 FREE_VOICE_IN = 1
 FREE_VOICE_OUT = 2
-FREE_PHOTO = 2  # Новый лимит для картинок
+FREE_PHOTO = 2
 
 
 def _connect():
@@ -42,7 +42,7 @@ def _sync_init_db():
         premium INTEGER NOT NULL DEFAULT 0, premium_until TEXT, last_active TEXT,
         bonus_requests INTEGER NOT NULL DEFAULT 0, ref_count INTEGER NOT NULL DEFAULT 0,
         referred_by INTEGER, started_once INTEGER NOT NULL DEFAULT 0,
-        voice_mode INTEGER NOT NULL DEFAULT 0)""")
+        voice_mode INTEGER NOT NULL DEFAULT 0, username TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, text TEXT NOT NULL,
         remind_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending')""")
@@ -62,6 +62,7 @@ def _sync_init_db():
     # Миграция для старых баз
     for col, tbl, typ in [
         ("voice_mode", "users", "INTEGER DEFAULT 0"),
+        ("username", "users", "TEXT"),
         ("voice_in", "user_limits", "INTEGER DEFAULT 0"),
         ("voice_out", "user_limits", "INTEGER DEFAULT 0"),
         ("photo_requests", "user_limits", "INTEGER DEFAULT 0")
@@ -73,6 +74,12 @@ def _sync_init_db():
             pass
 
     conn.close()
+
+
+def _sync_update_username(user_id, username):
+    conn = _connect(); cur = conn.cursor()
+    cur.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
+    conn.commit(); conn.close()
 
 
 def _sync_get_mode(user_id):
@@ -339,6 +346,7 @@ def _sync_user_stats(user_id):
 # ==================== ASYNC-ОБЁРТКИ ====================
 
 async def init_db(): await asyncio.to_thread(_sync_init_db)
+async def update_username(uid, uname): await asyncio.to_thread(_sync_update_username, uid, uname)
 async def get_user_mode(uid): return await asyncio.to_thread(_sync_get_mode, uid)
 async def set_user_mode(uid, m): await asyncio.to_thread(_sync_set_mode, uid, m)
 async def get_voice_mode(uid): return await asyncio.to_thread(_sync_get_voice_mode, uid)
