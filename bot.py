@@ -1,9 +1,8 @@
 """
-Бот-напоминалка с характером. Версия 0.25.4:
-- Ультра-токсичный режим (без нравоучений, с примерами)
+Бот-напоминалка с характером. Версия 0.25.5:
+- Сохранение username в БД (для статистики)
+- Ультра-токсичный режим
 - Фикс: голосовые напоминания
-- Фикс: голос без смайликов (пока не добавлено, но TTS чистит текст)
-- Фикс кнопок Premium
 - Анализ картинок (фото)
 - Мужской голос через edge-tts
 """
@@ -55,6 +54,7 @@ from database import (
     create_promocode, redeem_promocode, is_new_user, mark_user_started,
     register_referral, get_referral_stats, has_referral_discount,
     REF_BONUS_REFERRER, REF_BONUS_NEW, REF_DISCOUNT_THRESHOLD, REF_DISCOUNT_PERCENT,
+    update_username,  # <-- ДОБАВЛЕНО
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -137,6 +137,7 @@ COMMON_RULES = (
     "• Ты НЕ ChatGPT, НЕ Groq, НЕ Gemini, НЕ продукт OpenAI. Никогда не упоминай эти названия.\n"
     "• Если спрашивают про подписку, тарифы, лимиты: «Есть бесплатный тариф: 10 запросов, 2 напоминания, 1 голосовое, 2 фото. Premium — 45 звёзд в месяц».\n"
     "• НЕ выдумывай числа, статистику, факты.\n"
+    "• НИКОГДА не пиши код, не используй markdown-блоки (```), не выводи YAML или JSON. Общайся только обычным текстом.\n"
     "• НЕ пиши фразы типа «Сейчас поставлю напоминание» или «Напомню через 5 минут». ЭТО ДЕЛАЕТ КОД. Если код не сработал — скажи «Не понял время, напиши нормально».\n"
     "• Про бессмысленные напоминания отвечай с юмором: «Не в моих силах отложить такое, ты сам решай».\n"
     "\n"
@@ -355,6 +356,8 @@ async def actual_premium_price(uid): return PREMIUM_PRICE_DISCOUNTED if await ha
 @dp.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
     uid = message.from_user.id
+    if message.from_user.username:
+        await update_username(uid, message.from_user.username)
     await update_last_active(uid)
     if command.args and command.args.startswith("ref_"):
         try: ref_id = int(command.args[4:])
@@ -372,12 +375,16 @@ async def cmd_start(message: Message, command: CommandObject):
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
+    if message.from_user.username:
+        await update_username(message.from_user.id, message.from_user.username)
     await update_last_active(message.from_user.id)
     await message.answer("🤝 *Что я умею:*\n\n⏰ *Напоминания* — «напомни через 5 минут»\n\n🎙️ *Голосовой ввод* — отправь голосовое, я расшифрую.\n\n🗣️ *Голосовые ответы* — скажи «общайся голосом».\n\n🖼️ *Анализ фото* — отправь картинку и напиши вопрос к ней.\n\n📊 *Статистика* — «статистика»\n\n🎁 *Пригласить друга* — /invite\n\n💎 *Подписка* — /premium", parse_mode="Markdown")
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
     uid = message.from_user.id
+    if message.from_user.username:
+        await update_username(uid, message.from_user.username)
     await update_last_active(uid)
     current, premium = await cached_mode(uid), await cached_premium(uid)
     limits = await get_limits(uid)
@@ -388,6 +395,8 @@ async def cmd_settings(message: Message):
 @dp.message(Command("premium"))
 async def cmd_premium(message: Message):
     uid = message.from_user.id
+    if message.from_user.username:
+        await update_username(uid, message.from_user.username)
     await update_last_active(uid)
     if await cached_premium(uid):
         await message.answer("💎 *У тебя уже активен Premium.*\n\nСпасибо, бро! 🤝", parse_mode="Markdown"); return
@@ -405,6 +414,8 @@ async def cmd_paysupport(message: Message):
 @dp.message(Command("invite"))
 async def cmd_invite(message: Message):
     uid = message.from_user.id
+    if message.from_user.username:
+        await update_username(uid, message.from_user.username)
     await update_last_active(uid)
     stats = await get_referral_stats(uid)
     ref_count, bonuses = stats["ref_count"], stats["bonus_requests"]
@@ -432,6 +443,8 @@ async def cmd_createpromo(message: Message):
 @dp.message(F.text.regexp(STATS_PATTERN))
 async def on_stats(message: Message):
     uid = message.from_user.id
+    if message.from_user.username:
+        await update_username(uid, message.from_user.username)
     await update_last_active(uid)
     stats = await get_user_stats(uid)
     done, failed = stats.get("done", 0), stats.get("failed", 0)
@@ -446,6 +459,8 @@ async def on_stats(message: Message):
 @dp.message(F.text.regexp(INSULT_DEV_PATTERN))
 async def on_insult_dev(message: Message):
     uid = message.from_user.id
+    if message.from_user.username:
+        await update_username(uid, message.from_user.username)
     mode = await cached_mode(uid)
     if mode == "toxic": ans = "Слышь, ты. Ещё раз так скажешь про моего создателя — я тебя в чёрный список закину. Он тебе бота сделал, а ты язык распустил. За слова отвечай, петух."
     elif mode == "funny": ans = "Э, полегче, чемпион. Ты вообще кто такой, чтобы про моего создателя так говорить? Я его знаю, он нормальный мужик. Так что закрой рот и пользуйся ботом."
@@ -456,6 +471,8 @@ async def on_insult_dev(message: Message):
 @dp.message(F.photo)
 async def on_photo(message: Message):
     uid = message.from_user.id
+    if message.from_user.username:
+        await update_username(uid, message.from_user.username)
     await update_last_active(uid)
     
     if not await cached_premium(uid):
@@ -496,6 +513,8 @@ async def on_photo(message: Message):
 @dp.message(F.voice)
 async def on_voice(message: Message):
     uid = message.from_user.id
+    if message.from_user.username:
+        await update_username(uid, message.from_user.username)
     await update_last_active(uid)
     
     if not await cached_premium(uid):
@@ -524,6 +543,8 @@ async def on_voice(message: Message):
 
 @dp.message(F.text.regexp(VOICE_ON_PATTERN))
 async def on_voice_on(message: Message):
+    if message.from_user.username:
+        await update_username(message.from_user.id, message.from_user.username)
     await set_voice_mode(message.from_user.id, True)
     await message.answer("Ок, теперь буду отвечать голосом. Скажи «хватит», чтобы вернуть текст.")
 
@@ -644,6 +665,10 @@ async def handle_reminders(message: Message, text: str):
 async def handle_msg(message: Message):
     uid = message.from_user.id
     text = message.text.strip()
+
+    # СОХРАНЕНИЕ ЮЗЕРНЕЙМА
+    if message.from_user.username:
+        await update_username(uid, message.from_user.username)
 
     # 0. ВЫКЛЮЧЕНИЕ ГОЛОСА (расширенные триггеры)
     if VOICE_OFF_PATTERN.search(text.lower()):
